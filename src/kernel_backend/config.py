@@ -1,0 +1,26 @@
+from pathlib import Path
+from typing import Annotated, Literal
+
+from pydantic import Field
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    DATABASE_URL: str
+    MIGRATION_DATABASE_URL: str
+    KERNEL_SYSTEM_PEPPER: Annotated[str, Field(min_length=32)]
+    REDIS_HOST: str
+    REDIS_PORT: int = 6379
+    REDIS_PASSWORD: str
+    REDIS_SSL: bool = True
+    STORAGE_BACKEND: Literal["local", "r2"] = "local"
+    STORAGE_LOCAL_BASE_PATH: Path = Path("./data/media")
+    ENV: Literal["development", "production"] = "development"
+    LOG_LEVEL: str = "INFO"
+    SENTRY_DSN: str = ""
+
+    model_config = {"env_file": ".env", "extra": "ignore"}
+
+    @property
+    def system_pepper_bytes(self) -> bytes:
+        return bytes.fromhex(self.KERNEL_SYSTEM_PEPPER)
