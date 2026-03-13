@@ -1,0 +1,86 @@
+# Kernel Security — Test Fixture Manifest
+# Each file is a real media file in data/fixtures/.
+# Expected outcomes define what a correct implementation must produce.
+
+fixtures:
+
+  - file: speech_10s.mp4
+    description: "Short audio+video. H.264 + AAC 44.1 kHz. 10 seconds."
+    container: av
+    resolution: "960x540"
+    fps: 25
+    audio_sample_rate: 44100
+    active_signals: [pilot_audio, wid_audio, fingerprint_audio, pilot_video, wid_video, fingerprint_video]
+    expected_after_sign:
+      verdict: VERIFIED
+      wid_segments_min: 5
+    expected_after_compress_qp35:
+      verdict: VERIFIED
+      note: "RS must recover WID with up to 40% segments corrupted by H.264 QP 35"
+    expected_after_trim_50pct:
+      verdict: VERIFIED
+      note: "First 5s only — any K=16 segments sufficient for RS decode"
+
+  - file: outdoor_30s.mp4
+    description: "High-res audio+video. H.264 1080p 30fps + AAC 48 kHz. 30 seconds."
+    container: av
+    resolution: "1920x1080"
+    fps: 30
+    audio_sample_rate: 48000
+    active_signals: [pilot_audio, wid_audio, fingerprint_audio, pilot_video, wid_video, fingerprint_video]
+    expected_after_sign:
+      verdict: VERIFIED
+      note: "Validates 4x4 DCT at 1080p — agreement score expected > 0.75"
+
+  - file: audio_only.aac
+    description: "Audio-only. AAC stereo 44.1 kHz. 15 seconds."
+    container: audio_only
+    audio_sample_rate: 44100
+    active_signals: [pilot_audio, wid_audio, fingerprint_audio]
+    expected_after_sign:
+      verdict: VERIFIED
+
+  - file: video_only.mp4
+    description: "Video-only. H.264 720p 30fps. No audio stream. 20 seconds."
+    container: video_only
+    resolution: "1280x720"
+    fps: 30
+    active_signals: [pilot_video, wid_video, fingerprint_video]
+    expected_after_sign:
+      verdict: VERIFIED
+      note: "Weight override: video 0.40, fingerprint 0.60"
+
+  - file: speech_compressed.mp4
+    description: "speech_10s.mp4 re-encoded at H.264 QP 35."
+    container: av
+    is_derived_from: speech_10s.mp4
+    derivation: "ffmpeg -i speech_10s_signed.mp4 -c:v libx264 -crf 35 -c:a copy"
+    expected_after_sign_and_recompress:
+      verdict: VERIFIED
+
+  - file: speech_trimmed.mp4
+    description: "First 5s of signed speech_10s.mp4. Tests partial content verification."
+    container: av
+    is_derived_from: speech_10s.mp4
+    derivation: "ffmpeg -i speech_10s_signed.mp4 -t 5 -c copy"
+    expected_after_sign_and_trim:
+      verdict: VERIFIED
+
+synthetic:
+  - name: testsrc_av_10s
+    ffmpeg_cmd: >
+      ffmpeg -f lavfi -i testsrc2=duration=10:size=1280x720:rate=30
+      -f lavfi -i sine=frequency=440:duration=10
+      -c:v libx264 -pix_fmt yuv420p -preset ultrafast
+      -c:a aac -ar 44100 tests/fixtures/synthetic_av_10s.mp4
+
+  - name: testsrc_audio_only
+    ffmpeg_cmd: >
+      ffmpeg -f lavfi -i sine=frequency=440:duration=15
+      -c:a aac -ar 44100 tests/fixtures/synthetic_audio_15s.aac
+
+  - name: testsrc_video_only
+    ffmpeg_cmd: >
+      ffmpeg -f lavfi -i testsrc2=duration=20:size=1280x720:rate=30
+      -c:v libx264 -pix_fmt yuv420p -preset ultrafast
+      tests/fixtures/synthetic_video_20s.mp4

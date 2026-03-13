@@ -1,0 +1,14 @@
+# Ignore all media files — they are local, not committed
+*.wav
+*.mp3
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.flac
+*.ogg
+
+# Keep these
+!manifest.yaml
+!README.md
+!.gitignore

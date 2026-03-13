@@ -1,0 +1,175 @@
+version: "1.0"
+
+# ─── Audio ───────────────────────────────────────────────────────────────────
+
+audio:
+
+  speech:
+    description: "Speech recordings — primary blocking category for audio pipeline"
+    blocking: true
+    clips:
+      - id: "libri_male_01"
+        path: "audio/speech/libri_male_01.wav"
+        sha256: "f73626c9f8afa434d5a3d0d98b479549ecb23ed0fe2b2bd79757a7080379b7eb"
+        duration_s: 14.84
+        sample_rate: 44100
+        speaker: "M01"
+        language: "en"
+        source: "librosa:libri1"
+        conditions: ["studio", "clean", "male"]
+
+      - id: "libri_female_01"
+        path: "audio/speech/libri_female_01.wav"
+        sha256: "9e26635568b137552851110da2f711dfa34cd9452a004826e0ce0b7cbb07345f"
+        duration_s: 16.74
+        sample_rate: 44100
+        speaker: "F01"
+        language: "en"
+        source: "librosa:libri2"
+        conditions: ["studio", "clean", "female"]
+
+      - id: "choice_hiphop_01"
+        path: "audio/speech/choice_hiphop_01.wav"
+        sha256: "b752b40eb1a0794f2593a3070a7a5950e5f2ae44bec3c9e4befdd89ea5045b4f"
+        duration_s: 25.03
+        sample_rate: 44100
+        speaker: null
+        language: "en"
+        source: "librosa:choice"
+        conditions: ["music_mix", "vocal", "non_stationary"]
+
+  music:
+    description: "Music recordings — informational, non-blocking"
+    blocking: false
+    clips:
+      - id: "brahms_piano_01"
+        path: "audio/music/brahms_piano_01.wav"
+        sha256: "d386a1091cdba24093c934f43195bf696f0ed0995b6ff76cbb78eb8aa9d56620"
+        duration_s: 45.84
+        sample_rate: 44100
+        source: "librosa:brahms"
+        conditions: ["instrumental", "classical", "percussive"]
+
+      - id: "trumpet_01"
+        path: "audio/music/trumpet_01.wav"
+        sha256: "5d27eacaab3b81c43839cdce491e2482b24370145643a7b46bf1b118174aeb53"
+        duration_s: 5.33
+        sample_rate: 44100
+        source: "librosa:trumpet"
+        conditions: ["instrumental", "brass", "harmonic"]
+
+      - id: "vibeace_01"
+        path: "audio/music/vibeace_01.wav"
+        sha256: "b865539ab507b9bc6bf6e7dfa21c782a73abfd5802ee1d2f21eca12258d7b388"
+        duration_s: 61.46
+        sample_rate: 44100
+        source: "librosa:vibeace"
+        conditions: ["ambient", "low_energy", "sustained"]
+
+# ─── Video ───────────────────────────────────────────────────────────────────
+
+video:
+
+  speech:
+    description: "Monologue and conference-style video with speech audio"
+    blocking: true
+    clips:
+      - id: "speech_01"
+        path: "video/speech/speech.mp4"
+        sha256: "f5cf4f10a371643982795bb4fb5d6aaffe9db4af9e7100db46e273e47dedba0b"
+        duration_s: 206.16
+        fps: 25.0
+        resolution: [960, 540]
+        has_audio: true
+        conditions: ["interview", "indoor", "speech", "h264", "aac"]
+
+  outside:
+    description: "Outdoor interviews — ambient noise, variable light, wind"
+    blocking: true
+    clips:
+      - id: "camping_01"
+        path: "video/outdoor/camping_01.mp4"
+        sha256: "6a28f1b26e261249895a44bd98b66474dbfde0a7e9b167efab1856929105011f"
+        duration_s: 1057.90
+        fps: 30.0
+        resolution: [1280, 720]
+        has_audio: true
+        conditions: ["outdoor", "ambient_noise", "natural_light", "h264", "aac"]
+
+  without_audio:
+    description: "Video-only streams — no audio track present"
+    blocking: true
+    clips:
+      - id: "dark_no_audio_01"
+        path: "video/without_audio/video_dark_no_audio.mp4"
+        sha256: "d6617a009c0c6c9aebf7398d43cad6d1985ddc1b9ab0479e2ea977362b8af5b0"
+        duration_s: 30.53
+        fps: 30.0
+        resolution: [1920, 1080]
+        has_audio: true        # ffprobe detects an AAC track; name is misleading
+        conditions: ["indoor", "dark", "h264", "aac_track_present"]
+
+  others:
+    description: "Mixed or uncategorized video content — informational"
+    blocking: false
+    clips:
+      - id: "show_01"
+        path: "video/others/show.mp4"
+        sha256: "c14d8195d6bdd801f27cd783923c51db8f3cd4df602ba57773e5b236a09f2080"
+        duration_s: 300.28
+        fps: 29.97
+        resolution: [1280, 720]
+        has_audio: true
+        conditions: ["mixed", "indoor", "show", "h264", "aac"]
+
+# ─── Degradations ────────────────────────────────────────────────────────────
+
+degradations:
+  audio:
+    babble:
+      snr_db: [10, 20]
+      seed: 42
+    pink_noise:
+      snr_db: [20, 30]
+      seed: 42
+    mp3_sim:
+      bitrate_kbps: [32, 64]
+    voip_sim:
+      codec: "g711"
+      bandwidth_hz: [300, 3400]
+
+  video:
+    h264_recompress:
+      crf: [23, 28, 35]
+    resize:
+      targets: [[1280, 720], [854, 480]]
+    trim_offset:
+      offset_ms: [-100, 0, 100]
+
+# ─── Thresholds ──────────────────────────────────────────────────────────────
+
+thresholds:
+  audio:
+    speech:
+      babble_10db:     { pass_rate: 0.80, max_hamming: 10 }
+      pink_20db:       { pass_rate: 0.85, max_hamming: 10 }
+      mp3_32k:         { pass_rate: 0.80, max_hamming: 10 }
+      voip_sim:        { pass_rate: 0.70, max_hamming: 10 }
+      discrimination:  { pass_rate: 0.80, min_hamming: 20 }
+    music:
+      babble_10db:     { pass_rate: 0.65, max_hamming: 10 }
+      pink_20db:       { pass_rate: 0.70, max_hamming: 10 }
+      discrimination:  { pass_rate: 0.70, min_hamming: 20 }
+
+  video:
+    speech:
+      h264_crf23:      { pass_rate: 0.85, min_agreement: 0.55 }
+      h264_crf28:      { pass_rate: 0.75, min_agreement: 0.52 }
+      resize_720p:     { pass_rate: 0.80, min_agreement: 0.52 }
+    outside:
+      h264_crf23:      { pass_rate: 0.80, min_agreement: 0.52 }
+      h264_crf28:      { pass_rate: 0.70, min_agreement: 0.50 }
+      resize_720p:     { pass_rate: 0.75, min_agreement: 0.50 }
+    without_audio:
+      h264_crf23:      { pass_rate: 0.85, min_agreement: 0.55 }
+      h264_crf28:      { pass_rate: 0.75, min_agreement: 0.52 }
