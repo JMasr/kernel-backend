@@ -15,6 +15,9 @@ secrets/
 *.db
 *.sqlite3
 
+# Docs
+*.md
+
 # Test artifacts
 .pytest_cache/
 .hypothesis/
