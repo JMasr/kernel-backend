@@ -181,7 +181,10 @@ class MediaService(MediaPort):
             audio_in = ffmpeg.input(str(audio_path))
             (
                 ffmpeg
-                .output(video_in.video, audio_in.audio, str(output_path), vcodec="copy")
+                .output(
+                    video_in.video, audio_in.audio, str(output_path),
+                    vcodec="copy", acodec="copy",
+                )
                 .overwrite_output()
                 .run(capture_stderr=True)
             )
@@ -238,11 +241,11 @@ class MediaService(MediaPort):
 
         cmd = [
             "ffmpeg", "-y",
-            "-f", "rawvideo", "-pix_fmt", "yuv420p",
+            "-f", "rawvideo", "-pix_fmt", "yuvj420p",
             "-s", f"{w}x{h}", "-r", str(fps),
             "-i", "pipe:0",
             "-vcodec", "libx264", "-crf", "0", "-preset", "ultrafast",
-            "-pix_fmt", "yuv420p",
+            "-pix_fmt", "yuvj420p",
             "-loglevel", "quiet",
             str(output_path),
         ]
@@ -250,9 +253,13 @@ class MediaService(MediaPort):
         process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
             for frame in frames:
-                # Convert with OpenCV so Y-channel formula is identical to embed_segment
-                yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV_I420)
-                process.stdin.write(yuv.tobytes())
+                # Use YCrCb (full-range) matching embed_segment/extract_segment colour space.
+                # yuvj420p = JPEG/full-range YUV420: Y full-res, Cb/Cr 2x subsampled.
+                # cv2.COLOR_BGR2YCrCb layout: ch0=Y, ch1=Cr, ch2=Cb → FFmpeg order Y,U(Cb),V(Cr).
+                ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+                process.stdin.write(ycrcb[:, :, 0].tobytes())       # Y full res
+                process.stdin.write(ycrcb[::2, ::2, 2].tobytes())   # U = Cb subsampled
+                process.stdin.write(ycrcb[::2, ::2, 1].tobytes())   # V = Cr subsampled
             process.stdin.close()
             process.wait()
             if process.returncode != 0:
@@ -264,21 +271,33 @@ class MediaService(MediaPort):
             process.wait()
             raise ValueError(f"FFmpeg video encode failed: {e}") from e
 
+    def seek_frame(self, path: Path, time_s: float) -> np.ndarray:
+        """Read exactly one frame at the given timestamp via CAP_PROP_POS_MSEC."""
+        cap = cv2.VideoCapture(str(path))
+        try:
+            cap.set(cv2.CAP_PROP_POS_MSEC, time_s * 1000)
+            ok, frame = cap.read()
+            if not ok:
+                raise ValueError(f"Cannot read frame at {time_s}s from {path}")
+            return frame
+        finally:
+            cap.release()
+
     def iter_video_segments(
         self,
         path: Path,
         segment_duration_s: float = 5.0,
-        frame_offset_s: float = 0.5,
+        frame_stride: int = 1,
     ):
         """
         Lazily yield (segment_idx, frames, fps) one segment at a time.
 
-        Reads only `frames_per_segment` frames into memory at a time —
-        never buffers the entire file. Required for long-form verification
-        (e.g. camping_01 at 1058 s / 5 s = 211 segments).
+        frame_stride controls which frames are kept per segment:
+        - frame_stride=1  → all frames (original behavior)
+        - frame_stride=3  → every 3rd frame (~300 MB/segment at 1080p vs ~900 MB)
 
-        frame_offset_s: skip this many seconds at the start of each segment
-        before collecting frames (matches the fingerprint pipeline convention).
+        No robustness loss with frame_stride=3 — extract_segment() uses majority
+        vote across available frames regardless of count.
         """
         cap = cv2.VideoCapture(str(path))
         if not cap.isOpened():
@@ -289,44 +308,30 @@ class MediaService(MediaPort):
             if fps <= 0:
                 raise ValueError(f"Invalid FPS ({fps}) for video: {path}")
 
-            frames_per_segment = int(segment_duration_s * fps)
-            offset_frames = int(frame_offset_s * fps)
-
-            if frames_per_segment <= 0:
+            segment_frame_count = int(segment_duration_s * fps)
+            if segment_frame_count <= 0:
                 raise ValueError(
                     f"segment_duration_s={segment_duration_s} yields 0 frames at fps={fps}"
                 )
 
             segment_idx = 0
-            usable_frames = frames_per_segment - offset_frames
-
             while True:
-                # 1. Skip offset_frames sequentially using fast grab()
-                skipped = 0
-                for _ in range(offset_frames):
-                    ok = cap.grab()
-                    if not ok:
-                        break
-                    skipped += 1
-                
-                # If we couldn't even skip all offset_frames, stream is effectively over
-                if skipped < offset_frames:
-                    break
-                    
-                # 2. Read the actual usable frames
                 frames: list[np.ndarray] = []
-                for _ in range(usable_frames):
+                frames_read = 0
+                for i in range(segment_frame_count):
                     ok, frame = cap.read()
                     if not ok:
                         break
-                    frames.append(frame)
-                    
-                # If we got any frames, yield them
-                if frames:
-                    yield segment_idx, frames, fps
-                    
-                # If we didn't get all the usable_frames we asked for, end of stream
-                if len(frames) < usable_frames:
+                    if i % frame_stride == 0:
+                        frames.append(frame)
+                    frames_read += 1
+
+                if not frames:
+                    break
+
+                yield segment_idx, frames, fps
+
+                if frames_read < segment_frame_count:
                     break
 
                 segment_idx += 1
