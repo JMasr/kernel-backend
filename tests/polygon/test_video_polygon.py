@@ -759,3 +759,183 @@ def test_polygon_verify_long_video_memory(video_outside_clip: VideoClip, polygon
     assert result.verdict in (Verdict.VERIFIED, Verdict.RED), (
         f"Unexpected verdict: {result.verdict}"
     )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 9. AV PIPELINE (Phase 5)
+# sign_av + verify_av on real polygon clips.
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _skip_if_video_has_no_audio(clip: "VideoClip") -> None:
+    manifest = clip._meta  # type: ignore[attr-defined]
+    if not getattr(manifest, "has_audio", False):
+        pytest.skip(f"[{clip.id}] no audio track per manifest")
+
+
+@pytest.mark.polygon
+@pytest.mark.slow
+@pytest.mark.asyncio
+async def test_polygon_av_roundtrip_speech(video_speech_clip: VideoClip, polygon, tmp_path):
+    """
+    [POLYGON/BLOCKING] sign_av + verify_av on speech_01 (206s, 960×540).
+    speech_01 has audio per manifest. Assert verdict=VERIFIED.
+    """
+    _skip_if_video_has_no_audio(video_speech_clip)
+
+    from kernel_backend.core.services.signing_service import sign_av as _sign_av
+    from kernel_backend.core.services.verification_service import VerificationService
+    from kernel_backend.core.domain.verification import Verdict
+    from kernel_backend.core.domain.identity import Certificate
+    from kernel_backend.core.services.crypto_service import generate_keypair
+    from kernel_backend.infrastructure.media.media_service import MediaService
+    from kernel_backend.infrastructure.storage.local_storage import LocalStorageAdapter
+    from kernel_backend.infrastructure.database.repositories import VideoRepository
+    from kernel_backend.infrastructure.database.models import Base
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+
+    POLY_PEPPER = b"polygon-av-pepper-padded-32b!!!!"
+    media = MediaService()
+    priv_pem, pub_pem = generate_keypair()
+    cert = Certificate(
+        author_id="polygon-av-author",
+        name="Polygon AV Test",
+        institution="Test Suite",
+        public_key_pem=pub_pem,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+
+    storage = LocalStorageAdapter(base_path=tmp_path / "av_storage")
+    (tmp_path / "av_storage").mkdir(exist_ok=True)
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    async with factory() as session:
+        registry = VideoRepository(session=session)
+        sign_result = await _sign_av(
+            media_path=video_speech_clip.path,
+            certificate=cert,
+            private_key_pem=priv_pem,
+            storage=storage,
+            registry=registry,
+            pepper=POLY_PEPPER,
+            media=media,
+        )
+
+        signed_bytes = await storage.get(sign_result.signed_media_key)
+        signed_path = tmp_path / "signed_av.mp4"
+        signed_path.write_bytes(signed_bytes)
+
+        service = VerificationService()
+        result = await service.verify_av(
+            media_path=signed_path,
+            media=media,
+            storage=storage,
+            registry=registry,
+            pepper=POLY_PEPPER,
+        )
+
+    await engine.dispose()
+
+    assert result.verdict == Verdict.VERIFIED, (
+        f"[{video_speech_clip.id}] AV roundtrip: "
+        f"Expected VERIFIED, got {result.verdict} / {result.red_reason}"
+    )
+    assert result.audio_verdict == Verdict.VERIFIED
+    assert result.video_verdict == Verdict.VERIFIED
+
+
+@pytest.mark.polygon
+@pytest.mark.slow
+@pytest.mark.asyncio
+async def test_polygon_av_memory_without_audio(
+    video_without_audio_clip: VideoClip, polygon, tmp_path
+):
+    """
+    [POLYGON/BLOCKING] dark_no_audio_01 (1920×1080, 30s) has an audio track.
+    sign_av + verify_av at 1080p with frame_stride=3.
+    Peak memory must be < 800 MB.
+    Assert verdict=VERIFIED.
+    """
+    import tracemalloc
+
+    _skip_if_video_has_no_audio(video_without_audio_clip)
+
+    from kernel_backend.core.services.signing_service import sign_av as _sign_av
+    from kernel_backend.core.services.verification_service import VerificationService
+    from kernel_backend.core.domain.verification import Verdict
+    from kernel_backend.core.domain.identity import Certificate
+    from kernel_backend.core.services.crypto_service import generate_keypair
+    from kernel_backend.infrastructure.media.media_service import MediaService
+    from kernel_backend.infrastructure.storage.local_storage import LocalStorageAdapter
+    from kernel_backend.infrastructure.database.repositories import VideoRepository
+    from kernel_backend.infrastructure.database.models import Base
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+
+    POLY_PEPPER = b"polygon-av-1080p-pepper-padded!!"
+    media = MediaService()
+    priv_pem, pub_pem = generate_keypair()
+    cert = Certificate(
+        author_id="polygon-1080p-author",
+        name="1080p Test",
+        institution="Test Suite",
+        public_key_pem=pub_pem,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+
+    storage = LocalStorageAdapter(base_path=tmp_path / "av_1080p_storage")
+    (tmp_path / "av_1080p_storage").mkdir(exist_ok=True)
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    tracemalloc.start()
+
+    async with factory() as session:
+        registry = VideoRepository(session=session)
+        sign_result = await _sign_av(
+            media_path=video_without_audio_clip.path,
+            certificate=cert,
+            private_key_pem=priv_pem,
+            storage=storage,
+            registry=registry,
+            pepper=POLY_PEPPER,
+            media=media,
+        )
+
+        signed_bytes = await storage.get(sign_result.signed_media_key)
+        signed_path = tmp_path / "signed_1080p.mp4"
+        signed_path.write_bytes(signed_bytes)
+
+        service = VerificationService()
+        result = await service.verify_av(
+            media_path=signed_path,
+            media=media,
+            storage=storage,
+            registry=registry,
+            pepper=POLY_PEPPER,
+        )
+
+    _, peak_bytes = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    await engine.dispose()
+
+    peak_mb = peak_bytes / 1024 / 1024
+    assert peak_mb < 800, (
+        f"[{video_without_audio_clip.id}] Peak memory {peak_mb:.1f} MB exceeds 800 MB. "
+        "iter_video_segments(frame_stride=3) should keep 1080p under budget."
+    )
+    assert result.verdict == Verdict.VERIFIED, (
+        f"[{video_without_audio_clip.id}] AV 1080p: "
+        f"Expected VERIFIED, got {result.verdict} / {result.red_reason}"
+    )
