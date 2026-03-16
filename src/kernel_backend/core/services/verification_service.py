@@ -21,7 +21,12 @@ from pathlib import Path
 import numpy as np
 
 from kernel_backend.core.domain.manifest import CryptographicManifest
-from kernel_backend.core.domain.verification import RedReason, VerificationResult, Verdict
+from kernel_backend.core.domain.verification import (
+    AVVerificationResult,
+    RedReason,
+    VerificationResult,
+    Verdict,
+)
 from kernel_backend.core.ports.media import MediaPort
 from kernel_backend.core.ports.registry import RegistryPort
 from kernel_backend.core.ports.storage import StoragePort
@@ -30,6 +35,8 @@ from kernel_backend.engine.audio.fingerprint import (
     extract_hashes as extract_audio_hashes,
     extract_hashes_from_stream as extract_audio_hashes_from_stream,
 )
+from kernel_backend.engine.audio.wid_beacon import extract_symbol_segment as extract_audio_symbol
+from kernel_backend.engine.codec.hopping import plan_audio_hopping
 from kernel_backend.engine.codec.reed_solomon import ReedSolomonCodec, ReedSolomonError
 from kernel_backend.engine.video.fingerprint import (
     SEGMENT_DURATION_S as VIDEO_SEGMENT_S,
@@ -205,7 +212,6 @@ class VerificationService:
         for seg_idx, frames, _fps in media.iter_video_segments(
             media_path,
             segment_duration_s=VIDEO_SEGMENT_S,
-            frame_offset_s=0.5,
         ):
             if seg_idx >= rs_n:
                 break  # only process segments used at sign time
@@ -296,6 +302,249 @@ class VerificationService:
             n_erasures=n_erasures,
             fingerprint_confidence=fingerprint_confidence,
         )
+
+    async def verify_av(
+        self,
+        media_path: Path,
+        media: MediaPort,
+        storage: StoragePort,
+        registry: RegistryPort,
+        pepper: bytes,
+    ) -> AVVerificationResult:
+        """
+        AV verification pipeline.
+
+        Phase A — Candidate identification:
+            Extract both audio AND video fingerprints.
+            Match against registry using the union of both fingerprint sets.
+            A candidate is valid if either audio OR video fingerprints match
+            (the file may have been degraded on one channel but not the other).
+            Select best candidate by combined Hamming score.
+
+        Phase B — Cryptographic authentication:
+            Extract audio WID and video WID independently.
+            Both must equal the single stored_wid.
+            VERIFIED only if BOTH match AND Ed25519 is valid.
+
+        NOTE: Pilot agreement is NOT used here. At H.264 CRF 28 (standard social
+        media compression), pilot agreement drops below 0.75 threshold. Fingerprints
+        drive Phase A; WID + Ed25519 drive Phase B.
+        """
+        candidate = await self._identify_candidate(media_path, media, registry, pepper)
+
+        if candidate is None:
+            return AVVerificationResult(
+                verdict=Verdict.RED,
+                audio_verdict=Verdict.RED,
+                video_verdict=Verdict.RED,
+                red_reason=RedReason.CANDIDATE_NOT_FOUND,
+            )
+
+        content_id, author_public_key, confidence = candidate
+
+        entry = await registry.get_by_content_id(content_id)
+        if entry is None:
+            return AVVerificationResult(
+                verdict=Verdict.RED,
+                audio_verdict=Verdict.RED,
+                video_verdict=Verdict.RED,
+                content_id=content_id,
+                red_reason=RedReason.CANDIDATE_NOT_FOUND,
+                fingerprint_confidence=confidence,
+            )
+
+        stored_wid = derive_wid(entry.manifest_signature, content_id)
+        stored_manifest = _manifest_from_json(entry.manifest_json) if entry.manifest_json else None
+
+        # Phase B — extract audio WID
+        (audio_wid, audio_decodable,
+         audio_n_seg, audio_n_dec, audio_n_era) = self._extract_audio_wid(
+            media_path, media, content_id, author_public_key, entry.rs_n, pepper
+        )
+
+        # Phase B — extract video WID
+        (video_wid, video_decodable,
+         video_n_seg, video_n_dec, video_n_era) = self._extract_video_wid(
+            media_path, media, content_id, author_public_key, entry.rs_n, pepper
+        )
+
+        # WID comparison (before signature — WID mismatch is more specific)
+        audio_wid_ok = audio_decodable and (audio_wid == stored_wid.data)
+        video_wid_ok = video_decodable and (video_wid == stored_wid.data)
+
+        # Ed25519 signature verification
+        sig_valid = (
+            stored_manifest is not None
+            and verify_manifest(stored_manifest, entry.manifest_signature, author_public_key)
+        )
+
+        # Per-channel verdicts
+        audio_verdict = Verdict.VERIFIED if (audio_wid_ok and sig_valid) else Verdict.RED
+        video_verdict = Verdict.VERIFIED if (video_wid_ok and sig_valid) else Verdict.RED
+
+        # Top-level verdict from explicit decision table
+        verdict, red_reason = _compose_verdict(
+            audio_wid_ok, video_wid_ok, audio_decodable, video_decodable, sig_valid
+        )
+
+        return AVVerificationResult(
+            verdict=verdict,
+            audio_verdict=audio_verdict,
+            video_verdict=video_verdict,
+            content_id=content_id,
+            author_id=entry.author_id,
+            red_reason=red_reason,
+            wid_match=(verdict == Verdict.VERIFIED),
+            signature_valid=sig_valid,
+            audio_n_segments=audio_n_seg,
+            audio_n_decoded=audio_n_dec,
+            audio_n_erasures=audio_n_era,
+            video_n_segments=video_n_seg,
+            video_n_decoded=video_n_dec,
+            video_n_erasures=video_n_era,
+            fingerprint_confidence=confidence,
+        )
+
+    def _extract_audio_wid(
+        self,
+        media_path: Path,
+        media: MediaPort,
+        content_id: str,
+        author_public_key: str,
+        rs_n: int,
+        pepper: bytes,
+    ) -> tuple[bytes | None, bool, int, int, int]:
+        """
+        Extract audio WID via DSSS correlation over each 2-second segment.
+        Returns (decoded_wid, decodable, n_segments, n_decoded, n_erasures).
+        decoded_wid is None and decodable is False when RS decode fails.
+        """
+        band_configs = plan_audio_hopping(rs_n, content_id, author_public_key, pepper)
+        symbols: list[int | None] = []
+        erasure_positions: list[int] = []
+        n_segments_total = 0
+
+        for seg_idx, chunk, _ in media.iter_audio_segments(
+            media_path, segment_duration_s=2.0, target_sample_rate=44100
+        ):
+            if seg_idx >= rs_n:
+                break
+
+            n_segments_total += 1
+            pn_seed = int.from_bytes(
+                hmac.new(
+                    pepper,
+                    f"wid|{content_id}|{author_public_key}|{seg_idx}".encode(),
+                    hashlib.sha256,
+                ).digest()[:8],
+                "big",
+            )
+
+            symbol_byte, _conf = extract_audio_symbol(chunk, band_configs[seg_idx], pn_seed)
+
+            if symbol_byte is None:
+                erasure_positions.append(seg_idx)
+                symbols.append(None)
+            else:
+                symbols.append(symbol_byte)
+
+        n_erasures = len(erasure_positions)
+        n_decoded = n_segments_total - n_erasures
+
+        codec = ReedSolomonCodec(rs_n)
+        try:
+            decoded = codec.decode(symbols)
+            return decoded, True, n_segments_total, n_decoded, n_erasures
+        except ReedSolomonError:
+            return None, False, n_segments_total, n_decoded, n_erasures
+
+    def _extract_video_wid(
+        self,
+        media_path: Path,
+        media: MediaPort,
+        content_id: str,
+        author_public_key: str,
+        rs_n: int,
+        pepper: bytes,
+    ) -> tuple[bytes | None, bool, int, int, int]:
+        """
+        Extract video WID via QIM over each 5-second segment.
+        Returns (decoded_wid, decodable, n_segments, n_decoded, n_erasures).
+        decoded_wid is None and decodable is False when RS decode fails.
+        """
+        symbols: list[int | None] = []
+        erasure_positions: list[int] = []
+        n_segments_total = 0
+
+        for seg_idx, frames, _fps in media.iter_video_segments(
+            media_path,
+            segment_duration_s=VIDEO_SEGMENT_S,
+            frame_stride=3,
+        ):
+            if seg_idx >= rs_n:
+                break
+
+            n_segments_total += 1
+            result = extract_segment(
+                frames, content_id, author_public_key, seg_idx, pepper
+            )
+
+            if result.agreement < WID_AGREEMENT_THRESHOLD:
+                erasure_positions.append(seg_idx)
+                symbols.append(None)
+            else:
+                symbol_byte = result.extracted_bits[0] if result.extracted_bits else 0
+                symbols.append(symbol_byte)
+
+        n_erasures = len(erasure_positions)
+        n_decoded = n_segments_total - n_erasures
+
+        codec = ReedSolomonCodec(rs_n)
+        try:
+            decoded = codec.decode(symbols)
+            return decoded, True, n_segments_total, n_decoded, n_erasures
+        except ReedSolomonError:
+            return None, False, n_segments_total, n_decoded, n_erasures
+
+
+def _compose_verdict(
+    audio_wid_ok: bool,
+    video_wid_ok: bool,
+    audio_decodable: bool,
+    video_decodable: bool,
+    signature_ok: bool,
+) -> tuple[Verdict, RedReason | None]:
+    """
+    Explicit decision table for AV verdict composition.
+    Order is intentional — more specific reasons take precedence.
+    Candidate not found is handled before this function is called.
+    """
+    # Step 1: check decodability first (degradation, not tampering)
+    if not audio_decodable and not video_decodable:
+        return Verdict.RED, RedReason.WID_UNDECODABLE
+
+    if not audio_decodable:
+        return Verdict.RED, RedReason.AUDIO_WID_UNDECODABLE
+
+    if not video_decodable:
+        return Verdict.RED, RedReason.VIDEO_WID_UNDECODABLE
+
+    # Step 2: check WID match (tampering signal)
+    if not audio_wid_ok and not video_wid_ok:
+        return Verdict.RED, RedReason.WID_MISMATCH
+
+    if not audio_wid_ok:
+        return Verdict.RED, RedReason.AUDIO_WID_MISMATCH
+
+    if not video_wid_ok:
+        return Verdict.RED, RedReason.VIDEO_WID_MISMATCH
+
+    # Step 3: signature (checked last — WID mismatch is more specific)
+    if not signature_ok:
+        return Verdict.RED, RedReason.SIGNATURE_INVALID
+
+    # All checks passed
+    return Verdict.VERIFIED, None
 
 
 def _manifest_from_json(manifest_json: str) -> CryptographicManifest:
