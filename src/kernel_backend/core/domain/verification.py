@@ -37,6 +37,19 @@ class RedReason(str, Enum):
     # partial watermark detected but WID could not be recovered
     # (signed but too damaged to verify) — quality signal, NOT tampering
 
+    # Phase 5 — AV per-channel reasons
+    AUDIO_WID_MISMATCH    = "audio_wid_mismatch"
+    # RS decode succeeded on audio, but decoded audio WID != stored WID
+
+    VIDEO_WID_MISMATCH    = "video_wid_mismatch"
+    # RS decode succeeded on video, but decoded video WID != stored WID
+
+    AUDIO_WID_UNDECODABLE = "audio_wid_undecodable"
+    # RS decode failed on audio channel (too many erasures) — quality signal, NOT tampering
+
+    VIDEO_WID_UNDECODABLE = "video_wid_undecodable"
+    # RS decode failed on video channel (too many erasures) — quality signal, NOT tampering
+
 
 @dataclass(frozen=True)
 class VerificationResult:
@@ -60,4 +73,43 @@ class VerificationResult:
     n_erasures: int               = 0   # segments marked as erasure by RS
 
     # DIAGNOSTIC ONLY — never drives the verdict
+    fingerprint_confidence: float = 0.0
+
+
+@dataclass(frozen=True)
+class AVVerificationResult:
+    """
+    Phase 5 — AV verification result.
+
+    verdict is VERIFIED only when BOTH audio_wid == stored_wid AND
+    video_wid == stored_wid AND Ed25519 signature valid.
+
+    The OR policy reduces the attack surface to half — an adversary who
+    destroys one channel can manipulate the other undetected. AND is required.
+    """
+    # Top-level verdict — VERIFIED only if both channels pass
+    verdict: Verdict
+
+    # Per-channel verdicts — diagnostic resolution
+    audio_verdict: Verdict
+    video_verdict: Verdict
+
+    # Common fields
+    content_id: str | None       = None
+    author_id: str | None        = None
+    red_reason: RedReason | None = None
+
+    # Authentication proof
+    wid_match: bool       = False   # True only when VERIFIED
+    signature_valid: bool = False
+
+    # Per-channel diagnostics
+    audio_n_segments: int = 0
+    audio_n_decoded: int  = 0
+    audio_n_erasures: int = 0
+    video_n_segments: int = 0
+    video_n_decoded: int  = 0
+    video_n_erasures: int = 0
+
+    # Fingerprint lookup diagnostic — never drives verdict
     fingerprint_confidence: float = 0.0
