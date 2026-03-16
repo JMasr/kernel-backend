@@ -59,7 +59,7 @@ def test_iter_segments_does_not_buffer_all_frames():
     service hold more than one segment's worth of frames in memory.
 
     Proxy: the maximum length of the `frames` list yielded per segment must
-    equal approximately fps * (segment_duration_s - frame_offset_s), NOT
+    equal approximately fps * segment_duration_s (for frame_stride=1), NOT
     the total frame count of the video.
     """
     _requires_real_clip(SPEECH_01)
@@ -68,14 +68,13 @@ def test_iter_segments_does_not_buffer_all_frames():
 
     media = MediaService()
     SEGMENT_S = 5.0
-    OFFSET_S = 0.5
 
     for seg_idx, frames, fps in media.iter_video_segments(
         SPEECH_01,
         segment_duration_s=SEGMENT_S,
-        frame_offset_s=OFFSET_S,
+        frame_stride=1,
     ):
-        expected_max = int((SEGMENT_S - OFFSET_S) * fps) + 5  # +5 tolerance
+        expected_max = int(SEGMENT_S * fps) + 5  # +5 tolerance
         assert len(frames) <= expected_max, (
             f"Segment {seg_idx}: yielded {len(frames)} frames which exceeds "
             f"single-segment capacity ({expected_max}). "

@@ -49,6 +49,16 @@ def _fake_file(content: bytes = b"fake-video-data", filename: str = "test.mp4"):
     return ("file", (filename, io.BytesIO(content), "video/mp4"))
 
 
+def _video_only_media_mock() -> MagicMock:
+    """MediaService mock that reports has_video=True, has_audio=False → routes to verify()."""
+    media = MagicMock()
+    profile = MagicMock()
+    profile.has_video = True
+    profile.has_audio = False
+    media.probe.return_value = profile
+    return media
+
+
 # ── Tests ──────────────────────────────────────────────────────────────────────
 
 def test_post_verify_returns_200_on_verified():
@@ -63,7 +73,7 @@ def test_post_verify_returns_200_on_verified():
         return_value=result,
     ), patch(
         "kernel_backend.api.verification.router.MediaService",
-        return_value=MagicMock(),
+        return_value=_video_only_media_mock(),
     ):
         response = client.post("/verify", files=[_fake_file()])
 
@@ -92,7 +102,7 @@ def test_post_verify_returns_200_on_red_candidate_not_found():
         return_value=result,
     ), patch(
         "kernel_backend.api.verification.router.MediaService",
-        return_value=MagicMock(),
+        return_value=_video_only_media_mock(),
     ):
         response = client.post("/verify", files=[_fake_file()])
 
@@ -119,7 +129,7 @@ def test_post_verify_returns_200_on_red_wid_mismatch():
         return_value=result,
     ), patch(
         "kernel_backend.api.verification.router.MediaService",
-        return_value=MagicMock(),
+        return_value=_video_only_media_mock(),
     ):
         response = client.post("/verify", files=[_fake_file()])
 
@@ -155,7 +165,7 @@ def test_response_schema_has_no_top_level_score_field():
         return_value=result,
     ), patch(
         "kernel_backend.api.verification.router.MediaService",
-        return_value=MagicMock(),
+        return_value=_video_only_media_mock(),
     ):
         response = client.post("/verify", files=[_fake_file()])
 
