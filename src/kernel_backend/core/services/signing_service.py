@@ -338,9 +338,17 @@ async def sign_av(
     media: MediaPort,
 ) -> SigningResult:
     """
-    Audio+video signing pipeline.
-    Signs the video track, then the audio track, then muxes both.
+    Audio+Video signing pipeline with a SINGLE shared WID.
+
+    A single CryptographicManifest covers both signals. The WID is derived
+    once from the single Ed25519 signature and embedded in BOTH the audio DWT
+    band AND the video DCT coefficients.
+
+    An adversary who replaces either track cannot produce a valid WID for that
+    channel without the original Ed25519 private key — the WID is derived from
+    the signature over the original manifest which committed to BOTH channels.
     """
+    # 1. Probe — require both tracks
     profile = media.probe(media_path)
     if not profile.has_video or not profile.has_audio:
         raise ValueError(
@@ -348,32 +356,187 @@ async def sign_av(
             f"has_video={profile.has_video}, has_audio={profile.has_audio}"
         )
 
-    # Sign video track
-    video_result = await sign_video(
-        media_path, certificate, private_key_pem,
-        storage, registry, pepper, media,
+    # 2–3. IDs + content hash
+    content_id = str(uuid4())
+    content_hash = hashlib.sha256(media_path.read_bytes()).hexdigest()
+
+    # 4. Pilot hash (video)
+    pilot_hash = compute_pilot_hash_48(content_id)
+
+    # 5. Audio fingerprints (streaming — avoids loading all audio into memory)
+    target_sample_rate = 44100
+    chunk_stream = (chunk for _, chunk, _ in media.iter_audio_segments(
+        media_path, segment_duration_s=2.0, target_sample_rate=target_sample_rate
+    ))
+    audio_fingerprints = extract_audio_hashes_from_stream(
+        chunk_stream, target_sample_rate, key_material=pepper, pepper=pepper
     )
 
-    # Sign audio track
-    audio_result = await sign_audio(
-        media_path, certificate, private_key_pem,
-        storage, registry, pepper, media,
+    # 6. Video fingerprints
+    video_fingerprints = extract_video_hashes(
+        str(media_path), key_material=pepper, pepper=pepper
     )
 
-    # Combine active signals
+    # 7. RS parameters — use the SMALLER rs_n so both channels stay in sync
+    rs_n_audio = min(len(audio_fingerprints), 255)
+    rs_n_video = min(len(video_fingerprints), 255)
+    if rs_n_audio < 17:
+        raise ValueError(
+            f"Audio too short: only {rs_n_audio} segments (need ≥ 17 for RS with K=16)"
+        )
+    if rs_n_video < 17:
+        raise ValueError(
+            f"Video too short: only {rs_n_video} segments (need ≥ 17 for RS with K=16)"
+        )
+    rs_n = min(rs_n_audio, rs_n_video)
+
+    # 8. Single manifest covering BOTH channels
     active_signals = [
-        "video_pilot", "video_wid", "video_fingerprint",
         "audio_pilot", "audio_wid", "audio_fingerprint",
+        "video_pilot", "video_wid", "video_fingerprint",
     ]
+    manifest = CryptographicManifest(
+        content_id=content_id,
+        content_hash_sha256=content_hash,
+        fingerprints_audio=[fp.hash_hex for fp in audio_fingerprints],
+        fingerprints_video=[fp.hash_hex for fp in video_fingerprints],
+        author_id=certificate.author_id,
+        author_public_key=certificate.public_key_pem,
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
 
-    # Use video result's content_id as the primary
-    return SigningResult(
-        content_id=video_result.content_id,
-        signed_media_key=video_result.signed_media_key,
-        manifest=video_result.manifest,
-        signature=video_result.signature,
-        wid=video_result.wid,
+    # 9. Single Ed25519 signature
+    signature = sign_manifest(manifest, private_key_pem)
+
+    # 10. Single shared WID — embedded in BOTH audio and video
+    wid = derive_wid(signature, content_id)
+
+    # 11. Shared RS codeword
+    rs_symbols = ReedSolomonCodec(rs_n).encode(wid.data)
+
+    # 12. Audio pilot seed
+    global_pn_seed = int.from_bytes(
+        hmac.new(pepper, b"global_pilot_seed", hashlib.sha256).digest()[:8], "big"
+    )
+    band_configs = plan_audio_hopping(rs_n, content_id, certificate.public_key_pem, pepper)
+
+    # 13. Embed audio — streaming pass (avoids loading all audio into memory)
+    with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as tmp:
+        audio_signed_path = Path(tmp.name)
+
+    encoder_proc = media.encode_audio_stream(
+        sample_rate=target_sample_rate,
+        output_path=audio_signed_path,
+        codec="aac",
+        bitrate="192k",
+    )
+    try:
+        for seg_idx, chunk, _ in media.iter_audio_segments(
+            media_path, segment_duration_s=2.0, target_sample_rate=target_sample_rate
+        ):
+            chunk = embed_audio_pilot(chunk, target_sample_rate, pilot_hash, global_pn_seed)
+            if seg_idx < rs_n:
+                pn_seed = int.from_bytes(
+                    hmac.new(
+                        pepper,
+                        f"wid|{content_id}|{certificate.public_key_pem}|{seg_idx}".encode(),
+                        hashlib.sha256,
+                    ).digest()[:8],
+                    "big",
+                )
+                chunk = embed_audio_segment(
+                    chunk, rs_symbols[seg_idx], band_configs[seg_idx], pn_seed,
+                    target_snr_db=-6.0,  # -14 dB is destroyed by AAC 192k; -6 dB survives
+                )
+            if encoder_proc.stdin:
+                encoder_proc.stdin.write((chunk * 32768.0).astype(np.int16).tobytes())
+    finally:
+        if encoder_proc.stdin:
+            encoder_proc.stdin.close()
+        encoder_proc.wait()
+
+    # 14. Embed video — load all frames, embed with frame_stride=3 for efficiency
+    _VIDEO_EMBED_STRIDE = 3
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        video_signed_path = Path(tmp.name)
+
+    try:
+        all_frames, fps = media.read_video_frames(media_path)
+        frames_per_segment = int(VIDEO_SEGMENT_S * fps)
+
+        for seg_idx in range(rs_n):
+            start = seg_idx * frames_per_segment
+            end = min(start + frames_per_segment, len(all_frames))
+            if start >= len(all_frames):
+                break
+
+            symbol_bits = np.array(
+                [(rs_symbols[seg_idx] >> (7 - k)) & 1 for k in range(8)],
+                dtype=np.uint8,
+            )
+
+            # Embed pilot + WID only in strided frames (memory efficient; majority vote
+            # at extraction time operates on available frames regardless of count)
+            strided_indices = list(range(start, end, _VIDEO_EMBED_STRIDE))
+            strided_frames = [all_frames[i] for i in strided_indices]
+
+            for j, frame in enumerate(strided_frames):
+                strided_frames[j] = embed_video_pilot(frame, content_id, pepper)
+
+            strided_frames = embed_video_segment(
+                strided_frames,
+                symbol_bits,
+                content_id,
+                certificate.public_key_pem,
+                seg_idx,
+                pepper,
+            )
+
+            for j, i in enumerate(strided_indices):
+                all_frames[i] = strided_frames[j]
+
+        media.write_video_frames(all_frames, fps, video_signed_path)
+
+        # 15. Mux signed audio + signed video
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            output_path = Path(tmp.name)
+
+        try:
+            media.mux_video_audio(video_signed_path, audio_signed_path, output_path)
+
+            # 16. Store
+            storage_key = f"signed/{content_id}/output.mp4"
+            await storage.put(storage_key, output_path.read_bytes(), "video/mp4")
+        finally:
+            output_path.unlink(missing_ok=True)
+
+    finally:
+        video_signed_path.unlink(missing_ok=True)
+        audio_signed_path.unlink(missing_ok=True)
+
+    # 17. Persist — single VideoEntry with both active signals
+    await registry.save_video(VideoEntry(
+        content_id=content_id,
+        author_id=certificate.author_id,
+        author_public_key=certificate.public_key_pem,
         active_signals=active_signals,
-        rs_n=video_result.rs_n,
-        pilot_hash_48=video_result.pilot_hash_48,
+        rs_n=rs_n,
+        pilot_hash_48=pilot_hash,
+        manifest_signature=signature,
+        manifest_json=_manifest_to_json(manifest),
+    ))
+    # Store both audio and video fingerprints under the same content_id so
+    # Phase A candidate lookup succeeds when either channel is queried.
+    await registry.save_segments(content_id, audio_fingerprints, is_original=True)
+    await registry.save_segments(content_id, video_fingerprints, is_original=True)
+
+    return SigningResult(
+        content_id=content_id,
+        signed_media_key=storage_key,
+        manifest=manifest,
+        signature=signature,
+        wid=wid,
+        active_signals=active_signals,
+        rs_n=rs_n,
+        pilot_hash_48=pilot_hash,
     )
