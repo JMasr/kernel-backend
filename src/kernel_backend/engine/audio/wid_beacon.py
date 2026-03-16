@@ -16,7 +16,7 @@ def embed_segment(
     rs_symbol: int,             # single RS symbol, value 0–255
     band_config: BandConfig,    # from plan_audio_hopping
     pn_seed: int,               # HMAC(pepper, f"wid|{content_id}|{pubkey}|{i}")[:8]
-    chips_per_bit: int = 32,
+    chips_per_bit: int = 256,
     target_snr_db: float = -14.0,
 ) -> np.ndarray:
     """
@@ -51,7 +51,7 @@ def extract_segment(
     segment: np.ndarray,
     band_config: BandConfig,
     pn_seed: int,
-    chips_per_bit: int = 32,
+    chips_per_bit: int = 256,
 ) -> float:
     """
     Despread and return a soft correlation value in [0.0, 1.0].
@@ -81,6 +81,60 @@ def extract_segment(
     if not per_bit_corrs:
         return 0.0
     return float(np.mean(per_bit_corrs))
+
+
+def extract_symbol_segment(
+    segment: np.ndarray,
+    band_config: BandConfig,
+    pn_seed: int,
+    chips_per_bit: int = 256,
+    erasure_threshold: float = 0.10,
+) -> tuple[int | None, float]:
+    """
+    Decode the RS symbol from an audio segment via DSSS correlation.
+
+    Returns (symbol_byte, confidence) where symbol_byte is None if erasure.
+
+    Unlike extract_segment() which returns correlation magnitude only (for erasure
+    detection), this function uses the SIGN of normalized_correlation to decode
+    each bit value (bit=1 → positive correlation, bit=0 → negative correlation),
+    then packs the decoded bits into a byte (MSB first).
+
+    Used by verify_av() for audio WID comparison against stored_wid.
+    """
+    level = band_config.dwt_level
+    coeffs = pywt.wavedec(segment.astype(np.float64), "db4", level=level, mode="periodization")
+    band = coeffs[-2].astype(np.float32)
+
+    n_chips = 8 * chips_per_bit
+    pn = pn_sequence(n_chips, pn_seed)
+
+    if len(band) < chips_per_bit:
+        return None, 0.0
+
+    bits: list[int] = []
+    per_bit_confs: list[float] = []
+    for i in range(8):
+        bs = i * chips_per_bit
+        be = bs + chips_per_bit
+        if be > len(band):
+            break
+        corr = normalized_correlation(band[bs:be], pn[bs:be])
+        bits.append(1 if corr >= 0 else 0)
+        per_bit_confs.append(abs(corr))
+
+    if len(bits) < 8:
+        return None, 0.0
+
+    confidence = float(np.mean(per_bit_confs))
+    if confidence < erasure_threshold:
+        return None, confidence
+
+    symbol_byte = 0
+    for b in bits:
+        symbol_byte = (symbol_byte << 1) | b
+
+    return symbol_byte, confidence
 
 
 def _trim_or_pad(arr: np.ndarray, target_len: int) -> np.ndarray:
