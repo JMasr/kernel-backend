@@ -403,18 +403,17 @@ async def test_different_content_id_returns_red_wid_mismatch(db_session, tmp_pat
     )
     fake_sig = sign_manifest(fake_manifest, priv_b)
 
-    # Overwrite the stored entry with the fake signature (different WID)
-    from kernel_backend.core.domain.watermark import VideoEntry as VE
-    tampered_entry = VE(
-        content_id=entry_a.content_id,
-        author_id=entry_a.author_id,
-        author_public_key=pub_b,  # different key
-        active_signals=entry_a.active_signals,
-        rs_n=entry_a.rs_n,
-        pilot_hash_48=entry_a.pilot_hash_48,
-        manifest_signature=fake_sig,  # different signature → different WID
+    # Overwrite the stored row with the fake signature (different WID).
+    # We use a direct UPDATE because VideoRepository.save_video uses
+    # on_conflict_do_nothing, which would silently keep the original row.
+    from sqlalchemy import update as sa_update
+    from kernel_backend.infrastructure.database.models import Video
+    await db_session.execute(
+        sa_update(Video)
+        .where(Video.content_id == entry_a.content_id)
+        .values(manifest_signature=fake_sig, author_public_key=pub_b)
     )
-    await registry.save_video(tampered_entry)
+    await db_session.flush()
 
     service = VerificationService()
     result = await service.verify(
