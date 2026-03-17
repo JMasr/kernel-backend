@@ -55,9 +55,18 @@ This makes block selection resolution-independent — same content_id works at a
 | Constant | Value | Target | Survives |
 |---|---|---|---|
 | `QIM_STEP_PILOT` | 28.0 | DC coefficient `(0,0)` | H.264 CRF ≤ 28 |
-| `QIM_STEP_WID` | 8.0 | AC coefficients `{(0,1),(1,0),(1,1),(0,2)}` | H.264 CRF ≤ 28 |
+| `QIM_STEP_WID` | **64.0** | AC coefficients `{(0,1),(1,0),(1,1),(0,2)}` | H.264 CRF ≤ 28 |
 
-CRF 35 pilot is xfail (informational). QIM_STEP_PILOT was calibrated iteratively: 12→20→24→28.
+CRF 35 pilot is xfail (informational), but passed unexpectedly (xpassed) on noise-enriched synthetic video — the noise source adds energy to AC coefficients that benefits pilot survival too.
+QIM_STEP_PILOT was calibrated iteratively: 12→20→24→28.
+QIM_STEP_WID was calibrated iteratively: 8.0→64.0 (Phase 4). 8.0 caused quantization grid capture at H.264 QP≈28.
+
+## write_video_frames pixel format — critical
+
+`MediaService.write_video_frames()` must use `yuvj420p` (JPEG/full-range YUV420).
+- `yuv420p` (BT.601 limited-range) uses Y∈[16,235] — does NOT match `cv2.COLOR_BGR2YCrCb` (full-range Y∈[0,255]). This formula mismatch causes systematic QIM errors.
+- `yuvj444p` (full-range, no chroma subsampling) gives correct Y but 3× pipe bandwidth → BrokenPipeError on sequential tests.
+- `yuvj420p` (JPEG/full-range YUV420): correct full-range Y, chroma 2× subsampled, 1.5× bandwidth. Confirmed: 0/24 QIM errors at CRF 0/18/23/28.
 
 ## Module contracts
 

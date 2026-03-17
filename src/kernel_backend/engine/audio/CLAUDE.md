@@ -46,7 +46,16 @@ embed_segment(segment: np.ndarray, rs_symbol: int,
 
 extract_segment(segment: np.ndarray, band_config: BandConfig,
                 pn_seed: int, chips_per_bit: int = 32) -> float  # soft correlation [0,1]
+
+extract_symbol_segment(segment, band_config, pn_seed, chips_per_bit) -> tuple[int, float]
+# Returns (decoded_byte, confidence). Uses SIGNED correlation to decode bit=1 vs bit=0.
 ```
+
+**AAC survival threshold (Pre-6 finding):** The default `target_snr_db=-14.0` gives post-AAC-192k
+confidence ~0.20, which is above the 0.10 erasure threshold but only marginally. When `sign_av()`
+commits to a 192k bitrate, callers **must** pass `target_snr_db=-6.0`. At -6.0 dB, confidence
+is ~0.23 after AAC 192k and survives a second re-encode at the same bitrate.
+`sign_audio()` (256k) retains the default -14.0 dB.
 
 ### fingerprint.py
 
