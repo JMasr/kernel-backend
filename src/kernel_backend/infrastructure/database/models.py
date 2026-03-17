@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, text
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.sql import func
@@ -9,6 +9,44 @@ from sqlalchemy.sql import func
 
 class Base(DeclarativeBase):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Phase 6.A — Multi-tenancy
+# ---------------------------------------------------------------------------
+
+class OrgRecord(Base):
+    __tablename__ = "organizations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(255), nullable=False)
+    pepper_v1 = Column(String(64), nullable=True)
+    current_pepper_version = Column(Integer, nullable=False, server_default="1")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class ApiKeyRecord(Base):
+    __tablename__ = "api_keys"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    key_hash = Column(String(64), nullable=False, unique=True)
+    key_prefix = Column(String(12), nullable=False)
+    name = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+    is_active = Column(Boolean, nullable=False, server_default="true")
+
+
+class OrgMemberRecord(Base):
+    __tablename__ = "organization_members"
+    __table_args__ = (UniqueConstraint("org_id", "user_id", name="uq_org_members_org_user"),)
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String(255), nullable=False, index=True)
+    role = Column(String(50), nullable=False, server_default="member")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class Video(Base):
@@ -30,6 +68,7 @@ class Video(Base):
     status = Column(String(20), nullable=False, server_default="VALID")
     schema_version = Column(Integer, server_default=text("2"), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True, index=True)
 
 
 class EmbeddingRecipe(Base):
@@ -97,6 +136,20 @@ class Identity(Base):
     institution = Column(String(255), nullable=False)
     public_key_pem = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True, index=True)
+
+
+class InvitationRecord(Base):
+    __tablename__ = "invitations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    token = Column(UUID(as_uuid=True), nullable=False, unique=True, default=uuid.uuid4, index=True)
+    email = Column(String(255), nullable=False, index=True)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String(20), nullable=False, server_default="pending")  # pending|accepted|expired
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    accepted_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class AudioFingerprint(Base):
