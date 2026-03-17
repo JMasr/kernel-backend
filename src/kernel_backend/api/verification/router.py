@@ -89,6 +89,7 @@ async def verify_media(
 
         # Probe container type and route accordingly
         profile = media.probe(tmp_path)
+        org_id = getattr(request.state, "org_id", None)
 
         if profile.has_video and profile.has_audio:
             # AV container — use combined pipeline (Phase 5)
@@ -98,6 +99,7 @@ async def verify_media(
                 storage=storage,
                 registry=registry,
                 pepper=_PEPPER,
+                org_id=org_id,
             )
         elif profile.has_video:
             # Video-only container — use Phase 4 pipeline
@@ -107,6 +109,7 @@ async def verify_media(
                 storage=storage,
                 registry=registry,
                 pepper=_PEPPER,
+                org_id=org_id,
             )
         else:
             raise HTTPException(status_code=400, detail="No audio or video stream detected")

@@ -1,7 +1,7 @@
 import hashlib
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kernel_backend.api.dependencies import get_session
@@ -16,6 +16,7 @@ router = APIRouter(tags=["identity"])
 @router.post("/generate", status_code=201, response_model=CertificateResponse)
 async def generate_identity(
     body: GenerateIdentityRequest,
+    request: Request,
     session: AsyncSession = Depends(get_session),
 ) -> CertificateResponse:
     private_pem, public_pem = generate_keypair()
@@ -33,8 +34,12 @@ async def generate_identity(
         created_at=now,
     )
 
+    org_id = getattr(request.state, "org_id", None)
     repo = IdentityRepository(session)
-    await repo.create(certificate)
+    if org_id is not None:
+        await repo.create_with_org(certificate, org_id)
+    else:
+        await repo.create(certificate)
 
     return CertificateResponse(
         author_id=certificate.author_id,
@@ -43,4 +48,5 @@ async def generate_identity(
         public_key_pem=certificate.public_key_pem,
         private_key_pem=private_pem,
         created_at=certificate.created_at,
+        org_id=org_id,
     )

@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from uuid import UUID
+
 from pydantic import BaseModel, Field
 
 
@@ -13,3 +17,4 @@ class CertificateResponse(BaseModel):
     public_key_pem: str
     private_key_pem: str  # returned once, never stored, never logged
     created_at: str
+    org_id: UUID | None = None

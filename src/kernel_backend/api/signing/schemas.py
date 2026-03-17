@@ -21,4 +21,5 @@ class SignJobStatusResponse(BaseModel):
     """Returned on GET /sign/{job_id}."""
     job_id: str
     status: str          # "queued" | "in_progress" | "complete" | "not_found" | "failed"
+    progress: int = 0    # 0-100
     result: SignJobResult | None = None
