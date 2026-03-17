@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from uuid import UUID
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,8 @@ class VideoEntry:
     manifest_json: str = ""     # canonical manifest JSON — stored for signature verification
     schema_version: int = 2
     status: str = "VALID"       # "VALID" | "REVOKED"
+    org_id: UUID | None = None  # organization owning this entry (Phase 6.A)
+    signed_media_key: str = ""  # storage key for the signed media file (Phase 6.B-2)
 
 
 @dataclass(frozen=True)

@@ -6,7 +6,7 @@ import json
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import numpy as np
 
@@ -55,6 +55,7 @@ async def sign_audio(
     registry: RegistryPort,
     pepper: bytes,
     media: MediaPort,
+    org_id: UUID | None = None,
 ) -> SigningResult:
     """
     Full audio signing pipeline. Orchestrates DSP, cryptography, storage, and
@@ -181,6 +182,8 @@ async def sign_audio(
         pilot_hash_48=pilot_hash_48,
         manifest_signature=signature,
         manifest_json=_manifest_to_json(manifest),
+        org_id=org_id,
+        signed_media_key=storage_key,
     ))
     await registry.save_segments(content_id, fingerprints, is_original=True)
 
@@ -205,6 +208,7 @@ async def sign_video(
     registry: RegistryPort,
     pepper: bytes,
     media: MediaPort,
+    org_id: UUID | None = None,
 ) -> SigningResult:
     """
     Video-only signing pipeline.
@@ -313,6 +317,8 @@ async def sign_video(
         pilot_hash_48=pilot_hash,
         manifest_signature=signature,
         manifest_json=_manifest_to_json(manifest),
+        org_id=org_id,
+        signed_media_key=storage_key,
     ))
     await registry.save_segments(content_id, video_fingerprints, is_original=True)
 
@@ -336,6 +342,7 @@ async def sign_av(
     registry: RegistryPort,
     pepper: bytes,
     media: MediaPort,
+    org_id: UUID | None = None,
 ) -> SigningResult:
     """
     Audio+Video signing pipeline with a SINGLE shared WID.
@@ -524,6 +531,8 @@ async def sign_av(
         pilot_hash_48=pilot_hash,
         manifest_signature=signature,
         manifest_json=_manifest_to_json(manifest),
+        org_id=org_id,
+        signed_media_key=storage_key,
     ))
     # Store both audio and video fingerprints under the same content_id so
     # Phase A candidate lookup succeeds when either channel is queried.
