@@ -28,13 +28,36 @@ async def process_sign_job(ctx: dict, content_id: str, input_path: str):
 ARQ requeues jobs if a worker dies mid-execution. The sign job must be safe
 to run twice for the same `content_id` (check if already processed before writing to DB).
 
-**Status polling via Job.info():**
+**Status polling — Redis key takes precedence over ARQ (Phase 7.1):**
+
+`process_sign_job` writes a Redis key `job:{job_id}:status` (TTL 3600 s) at each
+milestone so the API endpoint can return a `progress` integer (0–100):
+
+```python
+# jobs.py — progress tracking pattern
+async def _set_job_status(redis, job_id: str, status: dict) -> None:
+    await redis.set(f"job:{job_id}:status", json.dumps(status), ex=3600)
+
+# In process_sign_job:
+await _set_job_status(redis, job_id, {"status": "processing", "progress": 0})
+# ... CPU work ...
+await _set_job_status(redis, job_id, {"status": "processing", "progress": 20})
+# ... sign ...
+await _set_job_status(redis, job_id, {"status": "completed", "progress": 100, "result": ...})
+```
+
+`ctx["redis"]` and `ctx["job_id"]` are injected automatically by ARQ.
+
+**Fallback: ARQ native Job.info() (no progress):**
 ```python
 from arq.jobs import Job, JobStatus
 job = Job(job_id=job_id, redis=redis_pool)
 status = await job.status()    # JobStatus enum
 info   = await job.info()      # includes result when complete
 ```
+
+The `GET /sign/{job_id}` endpoint checks the Redis key first; only falls back to
+ARQ's native status if the key is absent (e.g. jobs enqueued before Phase 7.1).
 
 ## redis_pool.py
 

@@ -4,10 +4,20 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from uuid import UUID
 
 from kernel_backend.core.domain.identity import Certificate
 from kernel_backend.core.services.signing_service import sign_audio
 from kernel_backend.infrastructure.media.media_service import MediaService
+
+
+async def _set_job_status(redis: object, job_id: str, status: dict) -> None:
+    """Write job status to Redis key job:{job_id}:status with 1-hour TTL."""
+    await redis.set(  # type: ignore[union-attr]
+        f"job:{job_id}:status",
+        json.dumps(status),
+        ex=3600,
+    )
 
 
 async def process_sign_job(
@@ -15,6 +25,7 @@ async def process_sign_job(
     media_path: str,
     certificate_json: str,
     private_key_pem: str,
+    org_id: str | None = None,
 ) -> dict:
     """
     Deserialize certificate_json → Certificate, then run sign_audio() in a
@@ -26,6 +37,9 @@ async def process_sign_job(
     Returns a JSON-serialisable dict: content_id, signed_media_key,
     active_signals, rs_n.
     """
+    redis = ctx.get("redis")
+    arq_job_id: str = ctx.get("job_id", "unknown")
+
     cert_data = json.loads(certificate_json)
     certificate = Certificate(
         author_id=cert_data["author_id"],
@@ -42,36 +56,79 @@ async def process_sign_job(
 
     loop = asyncio.get_event_loop()
 
-    if process_pool is not None:
-        result = await loop.run_in_executor(
-            process_pool,
-            _sign_sync,
-            media_path,
-            cert_data,
-            private_key_pem,
-            pepper,
-        )
-        # Persist via registry/storage (async, must happen in this loop)
-        # _sign_sync returns a plain dict; full storage/registry calls
-        # are handled inside sign_audio when called directly.
+    parsed_org_id: UUID | None = UUID(org_id) if org_id else None
+
+    try:
+        # Progress: processing (0%)
+        if redis is not None:
+            await _set_job_status(redis, arq_job_id, {
+                "job_id": arq_job_id, "status": "processing", "progress": 0,
+            })
+
+        if process_pool is not None:
+            # Progress: 20% — about to start CPU work
+            if redis is not None:
+                await _set_job_status(redis, arq_job_id, {
+                    "job_id": arq_job_id, "status": "processing", "progress": 20,
+                })
+
+            result = await loop.run_in_executor(
+                process_pool,
+                _sign_sync,
+                media_path,
+                cert_data,
+                private_key_pem,
+                pepper,
+                org_id,
+            )
+            # Persist via registry/storage (async, must happen in this loop)
+            # _sign_sync returns a plain dict; full storage/registry calls
+            # are handled inside sign_audio when called directly.
+        else:
+            # Progress: 20% — about to start in-process signing
+            if redis is not None:
+                await _set_job_status(redis, arq_job_id, {
+                    "job_id": arq_job_id, "status": "processing", "progress": 20,
+                })
+
+            # Fallback: run in-process (dev / test)
+            signing_result = await sign_audio(
+                media_path=Path(media_path),
+                certificate=certificate,
+                private_key_pem=private_key_pem,
+                storage=storage,
+                registry=registry,
+                pepper=pepper,
+                media=MediaService(),
+                org_id=parsed_org_id,
+            )
+            result = {
+                "content_id": signing_result.content_id,
+                "signed_media_key": signing_result.signed_media_key,
+                "active_signals": signing_result.active_signals,
+                "rs_n": signing_result.rs_n,
+            }
+
+        # Progress: completed (100%)
+        if redis is not None:
+            await _set_job_status(redis, arq_job_id, {
+                "job_id": arq_job_id,
+                "status": "completed",
+                "progress": 100,
+                "result": result,
+            })
+
         return result
-    else:
-        # Fallback: run in-process (dev / test)
-        result = await sign_audio(
-            media_path=Path(media_path),
-            certificate=certificate,
-            private_key_pem=private_key_pem,
-            storage=storage,
-            registry=registry,
-            pepper=pepper,
-            media=MediaService(),
-        )
-        return {
-            "content_id": result.content_id,
-            "signed_media_key": result.signed_media_key,
-            "active_signals": result.active_signals,
-            "rs_n": result.rs_n,
-        }
+
+    except Exception as exc:
+        if redis is not None:
+            await _set_job_status(redis, arq_job_id, {
+                "job_id": arq_job_id,
+                "status": "failed",
+                "progress": 0,
+                "error": str(exc),
+            })
+        raise
 
 
 def _sign_sync(
@@ -79,6 +136,7 @@ def _sign_sync(
     cert_data: dict,
     private_key_pem: str,
     pepper: bytes,
+    org_id: str | None = None,
 ) -> dict:
     """Top-level picklable wrapper that runs sign_audio in a new event loop.
 
@@ -114,6 +172,9 @@ def _sign_sync(
         async def get_valid_candidates(self) -> list: return []
         async def match_fingerprints(self, *a: object, **kw: object) -> list: return []
 
+    from uuid import UUID as _UUID  # noqa: PLC0415
+    parsed_org_id = _UUID(org_id) if org_id else None
+
     result = asyncio.run(sign_audio(
         media_path=__import__("pathlib").Path(media_path),
         certificate=certificate,
@@ -122,6 +183,7 @@ def _sign_sync(
         registry=_NullRegistry(),
         pepper=pepper,
         media=MediaService(),
+        org_id=parsed_org_id,
     ))
     return {
         "content_id": result.content_id,
