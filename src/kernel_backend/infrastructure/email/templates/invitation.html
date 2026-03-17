@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background-color: #1C1E22; color: #F5F5F7; margin: 0; padding: 20px; }
+    .container { max-width: 600px; margin: 40px auto; background: #25282D; border-radius: 8px; padding: 40px; }
+    .logo { color: #00FF41; font-size: 24px; font-weight: 700; margin-bottom: 32px; }
+    h1 { font-size: 28px; margin: 0 0 16px 0; color: #FFFFFF; }
+    p { line-height: 1.6; color: #FFFFFF; margin: 16px 0; }
+    .button { display: inline-block; padding: 14px 28px; background: #00FF41; color: #000000; text-decoration: none; border-radius: 4px; font-weight: 600; text-transform: uppercase; margin: 24px 0; }
+    .footer { margin-top: 40px; padding-top: 20px; border-top: 1px solid #374151; font-size: 14px; color: #FFFFFF; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="logo">KERNEL SECURITY</div>
+    <h1>Invitación a {{ org_name }}</h1>
+    <p>Has sido invitado a unirte a <strong>{{ org_name }}</strong> en Kernel Security.</p>
+    <p>Haz clic en el botón para aceptar la invitación y crear tu cuenta:</p>
+    <div style="text-align: center;">
+      <a href="{{ invite_link }}" class="button">Aceptar Invitación</a>
+    </div>
+    <div class="footer">
+      <p>Este enlace expira en 7 días.</p>
+      <p>Si no esperabas este email, puedes ignorarlo.</p>
+    </div>
+  </div>
+</body>
+</html>

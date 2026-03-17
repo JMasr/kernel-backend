@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { font-family: 'Inter', sans-serif; background-color: #1C1E22; color: #F5F5F7; margin: 0; padding: 20px; }
+    .container { max-width: 600px; margin: 40px auto; background: #25282D; border-radius: 8px; padding: 40px; }
+    .logo { color: #00FF41; font-size: 24px; font-weight: 700; margin-bottom: 32px; }
+    h1 { font-size: 28px; margin: 0 0 16px 0; color: #FFFFFF; }
+    p { line-height: 1.6; color: #FFFFFF; margin: 16px 0; }
+    .button { display: inline-block; padding: 14px 28px; background: #00FF41; color: #000; text-decoration: none; border-radius: 4px; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="logo">KERNEL SECURITY</div>
+    <h1>Tu video ha sido firmado</h1>
+    <p>El video <strong>{{ filename }}</strong> ha sido firmado exitosamente.</p>
+    <p style="text-align: center; margin: 32px 0;">
+      <a href="{{ content_link }}" class="button">Ver Contenido</a>
+    </p>
+  </div>
+</body>
+</html>
