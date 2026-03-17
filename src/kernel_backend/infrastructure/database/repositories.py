@@ -1,11 +1,14 @@
 import json
+from typing import Optional
+from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kernel_backend.core.domain.identity import Certificate
 from kernel_backend.core.domain.watermark import SegmentFingerprint, VideoEntry
+from kernel_backend.core.ports.registry import RegistryPort
 from kernel_backend.infrastructure.database.models import AudioFingerprint, Identity, Video
 
 
@@ -30,6 +33,38 @@ class IdentityRepository:
         )
         await self._session.execute(stmt)
         await self._session.commit()
+
+    async def create_with_org(self, certificate: Certificate, org_id: UUID) -> None:
+        """Persist certificate linked to an organization. Idempotent on author_id."""
+        stmt = (
+            insert(Identity)
+            .values(
+                author_id=certificate.author_id,
+                name=certificate.name,
+                institution=certificate.institution,
+                public_key_pem=certificate.public_key_pem,
+                org_id=org_id,
+            )
+            .on_conflict_do_nothing(index_elements=["author_id"])
+        )
+        await self._session.execute(stmt)
+        await self._session.commit()
+
+    async def get_by_org_id(self, org_id: UUID) -> list[Certificate]:
+        """Return all certificates belonging to an organization."""
+        result = await self._session.execute(
+            select(Identity).where(Identity.org_id == org_id)
+        )
+        return [
+            Certificate(
+                author_id=row.author_id,
+                name=row.name,
+                institution=row.institution,
+                public_key_pem=row.public_key_pem,
+                created_at=row.created_at.isoformat(),
+            )
+            for row in result.scalars().all()
+        ]
 
     async def get_by_author_id(self, author_id: str) -> Certificate | None:
         """
@@ -67,6 +102,8 @@ def _video_row_to_entry(row: Video) -> VideoEntry:
         manifest_json=row.manifest_json or "",
         schema_version=row.schema_version,
         status=row.status or "VALID",
+        org_id=row.org_id,
+        signed_media_key=row.signed_storage_key or "",
     )
 
 
@@ -88,6 +125,8 @@ class VideoRepository:
                 manifest_json=entry.manifest_json if entry.manifest_json else None,
                 schema_version=entry.schema_version,
                 status=entry.status,
+                org_id=entry.org_id,
+                signed_storage_key=entry.signed_media_key if entry.signed_media_key else None,
             )
             .on_conflict_do_nothing(index_elements=["content_id"])
         )
@@ -100,6 +139,36 @@ class VideoRepository:
         )
         row = result.scalar_one_or_none()
         return None if row is None else _video_row_to_entry(row)
+
+    async def save_video_with_org(self, entry: VideoEntry, org_id: UUID) -> None:
+        """Persist a VideoEntry linked to an organization. Idempotent on content_id."""
+        stmt = (
+            insert(Video)
+            .values(
+                content_id=entry.content_id,
+                author_id=entry.author_id,
+                author_public_key=entry.author_public_key,
+                active_signals_json=json.dumps(entry.active_signals),
+                rs_n=entry.rs_n,
+                pilot_hash_48=entry.pilot_hash_48,
+                manifest_signature=entry.manifest_signature,
+                manifest_json=entry.manifest_json if entry.manifest_json else None,
+                schema_version=entry.schema_version,
+                status=entry.status,
+                org_id=org_id,
+                signed_storage_key=entry.signed_media_key if entry.signed_media_key else None,
+            )
+            .on_conflict_do_nothing(index_elements=["content_id"])
+        )
+        await self._session.execute(stmt)
+        await self._session.commit()
+
+    async def get_by_org_id(self, org_id: UUID) -> list[VideoEntry]:
+        """Return all video entries belonging to an organization."""
+        result = await self._session.execute(
+            select(Video).where(Video.org_id == org_id)
+        )
+        return [_video_row_to_entry(r) for r in result.scalars().all()]
 
     async def get_valid_candidates(self) -> list[VideoEntry]:
         result = await self._session.execute(
@@ -126,9 +195,23 @@ class VideoRepository:
         self,
         hashes: list[str],
         max_hamming: int = 10,
+        org_id: UUID | None = None,
     ) -> list[VideoEntry]:
-        """Iterate all stored fingerprints and compute hamming distance in Python."""
-        result = await self._session.execute(select(AudioFingerprint))
+        """Iterate all stored fingerprints and compute hamming distance in Python.
+
+        When org_id is provided, only fingerprints belonging to that organization
+        are considered (multi-tenant isolation).
+        """
+        if org_id is not None:
+            stmt = (
+                select(AudioFingerprint)
+                .join(Video, AudioFingerprint.content_id == Video.content_id)
+                .where(Video.org_id == org_id)
+            )
+        else:
+            stmt = select(AudioFingerprint)
+
+        result = await self._session.execute(stmt)
         all_fp = result.scalars().all()
 
         matching_content_ids: set[str] = set()
@@ -144,3 +227,90 @@ class VideoRepository:
             if entry is not None:
                 entries.append(entry)
         return entries
+
+    async def list_by_org_id(
+        self,
+        org_id: UUID,
+        author_id: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[tuple[VideoEntry, str | None, str | None]]:
+        """List org content with pagination.
+
+        Returns list of (VideoEntry, author_name, created_at_iso) tuples.
+        author_name is None if no identity record exists for the author.
+        created_at_iso is ISO-8601 string from the Video row.
+        """
+        stmt = (
+            select(Video, Identity.name)
+            .outerjoin(Identity, (Video.author_id == Identity.author_id) & (Video.org_id == Identity.org_id))
+            .where(Video.org_id == org_id)
+        )
+        if author_id is not None:
+            stmt = stmt.where(Video.author_id == author_id)
+        stmt = stmt.order_by(Video.created_at.desc()).limit(limit).offset(offset)
+
+        result = await self._session.execute(stmt)
+        rows = result.all()
+
+        out: list[tuple[VideoEntry, str | None, str | None]] = []
+        for video_row, author_name in rows:
+            entry = _video_row_to_entry(video_row)
+            created_at_iso = video_row.created_at.isoformat() if video_row.created_at else None
+            out.append((entry, author_name, created_at_iso))
+        return out
+
+    async def count_by_org_id(
+        self,
+        org_id: UUID,
+        author_id: Optional[str] = None,
+    ) -> int:
+        """Count total video entries for an organization."""
+        stmt = select(func.count()).select_from(Video).where(Video.org_id == org_id)
+        if author_id is not None:
+            stmt = stmt.where(Video.author_id == author_id)
+        result = await self._session.execute(stmt)
+        return result.scalar_one()
+
+
+class SessionFactoryRegistry(RegistryPort):
+    """RegistryPort adapter that creates a fresh session per method call.
+
+    Required for app.state.registry: VideoRepository is session-scoped
+    (takes AsyncSession), so it cannot be stored directly in app.state.
+    This wrapper holds the session factory and opens a new session for
+    each port method invocation.
+    """
+
+    def __init__(self, session_factory: object) -> None:
+        self._factory = session_factory
+
+    async def save_video(self, entry: VideoEntry) -> None:
+        async with self._factory() as session:  # type: ignore[operator]
+            await VideoRepository(session).save_video(entry)
+
+    async def get_by_content_id(self, content_id: str) -> VideoEntry | None:
+        async with self._factory() as session:  # type: ignore[operator]
+            return await VideoRepository(session).get_by_content_id(content_id)
+
+    async def get_valid_candidates(self) -> list[VideoEntry]:
+        async with self._factory() as session:  # type: ignore[operator]
+            return await VideoRepository(session).get_valid_candidates()
+
+    async def save_segments(
+        self,
+        content_id: str,
+        segments: list[SegmentFingerprint],
+        is_original: bool,
+    ) -> None:
+        async with self._factory() as session:  # type: ignore[operator]
+            await VideoRepository(session).save_segments(content_id, segments, is_original)
+
+    async def match_fingerprints(
+        self,
+        hashes: list[str],
+        max_hamming: int = 10,
+        org_id: UUID | None = None,
+    ) -> list[VideoEntry]:
+        async with self._factory() as session:  # type: ignore[operator]
+            return await VideoRepository(session).match_fingerprints(hashes, max_hamming, org_id)
