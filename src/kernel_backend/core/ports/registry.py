@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from uuid import UUID
 
 from kernel_backend.core.domain.watermark import SegmentFingerprint, VideoEntry
 
@@ -28,4 +29,11 @@ class RegistryPort(ABC):
         self,
         hashes: list[str],
         max_hamming: int = 10,
-    ) -> list[VideoEntry]: ...
+        org_id: UUID | None = None,
+    ) -> list[VideoEntry]:
+        """
+        Return VideoEntry candidates whose stored fingerprints are within
+        max_hamming of any query hash. When org_id is provided, only entries
+        belonging to that organization are considered (multi-tenant isolation).
+        """
+        ...

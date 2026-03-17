@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 from pathlib import Path
+from uuid import UUID
 
 import numpy as np
 
@@ -65,6 +66,7 @@ class VerificationService:
         storage: StoragePort,
         registry: RegistryPort,
         pepper: bytes,
+        org_id: UUID | None = None,
     ) -> VerificationResult:
         """
         Two-phase verification pipeline.
@@ -83,7 +85,7 @@ class VerificationService:
 
         The two phases must not be merged.
         """
-        candidate = await self._identify_candidate(media_path, media, registry, pepper)
+        candidate = await self._identify_candidate(media_path, media, registry, pepper, org_id)
 
         if candidate is None:
             return VerificationResult(
@@ -130,6 +132,7 @@ class VerificationService:
         media: MediaPort,
         registry: RegistryPort,
         pepper: bytes,
+        org_id: UUID | None = None,
     ) -> tuple[str, str, float] | None:
         """
         Phase A: fingerprint extraction + registry lookup.
@@ -165,6 +168,7 @@ class VerificationService:
         candidates = await registry.match_fingerprints(
             query_hashes,
             max_hamming=_MAX_HAMMING_CANDIDATE,
+            org_id=org_id,
         )
 
         if not candidates:
@@ -310,6 +314,7 @@ class VerificationService:
         storage: StoragePort,
         registry: RegistryPort,
         pepper: bytes,
+        org_id: UUID | None = None,
     ) -> AVVerificationResult:
         """
         AV verification pipeline.
@@ -330,7 +335,7 @@ class VerificationService:
         media compression), pilot agreement drops below 0.75 threshold. Fingerprints
         drive Phase A; WID + Ed25519 drive Phase B.
         """
-        candidate = await self._identify_candidate(media_path, media, registry, pepper)
+        candidate = await self._identify_candidate(media_path, media, registry, pepper, org_id)
 
         if candidate is None:
             return AVVerificationResult(
