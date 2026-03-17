@@ -14,6 +14,7 @@ secrets/
 # Database
 *.db
 *.sqlite3
+.hypothesis
 
 # Docs
 *.md
