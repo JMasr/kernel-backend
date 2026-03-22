@@ -307,6 +307,107 @@ class VerificationService:
             fingerprint_confidence=fingerprint_confidence,
         )
 
+    async def verify_audio(
+        self,
+        media_path: Path,
+        media: MediaPort,
+        storage: StoragePort,
+        registry: RegistryPort,
+        pepper: bytes,
+        org_id: UUID | None = None,
+    ) -> VerificationResult:
+        """
+        Audio-only verification pipeline.
+
+        Same two-phase structure as verify() but uses audio fingerprints for
+        Phase A and audio WID extraction (DSSS) for Phase B.
+        """
+        candidate = await self._identify_candidate(media_path, media, registry, pepper, org_id)
+
+        if candidate is None:
+            return VerificationResult(
+                verdict=Verdict.RED,
+                red_reason=RedReason.CANDIDATE_NOT_FOUND,
+            )
+
+        content_id, author_public_key, confidence = candidate
+
+        entry = await registry.get_by_content_id(content_id)
+        if entry is None:
+            return VerificationResult(
+                verdict=Verdict.RED,
+                content_id=content_id,
+                red_reason=RedReason.CANDIDATE_NOT_FOUND,
+                fingerprint_confidence=confidence,
+            )
+
+        stored_wid = derive_wid(entry.manifest_signature, content_id)
+        stored_manifest = _manifest_from_json(entry.manifest_json) if entry.manifest_json else None
+
+        # Phase B — extract audio WID via DSSS
+        decoded_wid, decodable, n_seg, n_dec, n_era = self._extract_audio_wid(
+            media_path, media, content_id, author_public_key, entry.rs_n, pepper
+        )
+
+        if not decodable:
+            return VerificationResult(
+                verdict=Verdict.RED,
+                content_id=content_id,
+                author_id=entry.author_id,
+                author_public_key=author_public_key,
+                red_reason=RedReason.WID_UNDECODABLE,
+                n_segments_total=n_seg,
+                n_segments_decoded=n_dec,
+                n_erasures=n_era,
+                fingerprint_confidence=confidence,
+            )
+
+        if decoded_wid != stored_wid.data:
+            return VerificationResult(
+                verdict=Verdict.RED,
+                content_id=content_id,
+                author_id=entry.author_id,
+                author_public_key=author_public_key,
+                red_reason=RedReason.WID_MISMATCH,
+                wid_match=False,
+                n_segments_total=n_seg,
+                n_segments_decoded=n_dec,
+                n_erasures=n_era,
+                fingerprint_confidence=confidence,
+            )
+
+        sig_valid = (
+            stored_manifest is not None
+            and verify_manifest(stored_manifest, entry.manifest_signature, author_public_key)
+        )
+        if not sig_valid:
+            return VerificationResult(
+                verdict=Verdict.RED,
+                content_id=content_id,
+                author_id=entry.author_id,
+                author_public_key=author_public_key,
+                red_reason=RedReason.SIGNATURE_INVALID,
+                wid_match=True,
+                signature_valid=False,
+                n_segments_total=n_seg,
+                n_segments_decoded=n_dec,
+                n_erasures=n_era,
+                fingerprint_confidence=confidence,
+            )
+
+        return VerificationResult(
+            verdict=Verdict.VERIFIED,
+            content_id=content_id,
+            author_id=entry.author_id,
+            author_public_key=author_public_key,
+            wid_match=True,
+            signature_valid=True,
+            n_segments_total=n_seg,
+            n_segments_decoded=n_dec,
+            n_erasures=n_era,
+            fingerprint_confidence=confidence,
+        )
+
     async def verify_av(
         self,
         media_path: Path,
