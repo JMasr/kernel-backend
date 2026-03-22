@@ -2,14 +2,21 @@ import json
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import delete as sql_delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kernel_backend.core.domain.identity import Certificate
 from kernel_backend.core.domain.watermark import SegmentFingerprint, VideoEntry
 from kernel_backend.core.ports.registry import RegistryPort
-from kernel_backend.infrastructure.database.models import AudioFingerprint, Identity, Video
+from kernel_backend.infrastructure.database.models import (
+    AudioFingerprint,
+    EmbeddingRecipe,
+    Identity,
+    PilotToneIndex,
+    Video,
+    VideoSegment,
+)
 
 
 class IdentityRepository:
@@ -65,6 +72,13 @@ class IdentityRepository:
             )
             for row in result.scalars().all()
         ]
+
+    async def delete_by_author_id(self, author_id: str) -> bool:
+        """Delete identity by author_id. Returns True if deleted, False if not found."""
+        stmt = sql_delete(Identity).where(Identity.author_id == author_id)
+        result = await self._session.execute(stmt)
+        await self._session.commit()
+        return result.rowcount > 0
 
     async def get_by_author_id(self, author_id: str) -> Certificate | None:
         """
@@ -259,6 +273,36 @@ class VideoRepository:
             created_at_iso = video_row.created_at.isoformat() if video_row.created_at else None
             out.append((entry, author_name, created_at_iso))
         return out
+
+    async def delete_by_content_id(self, content_id: UUID, org_id: UUID) -> bool:
+        """Delete a video entry and all related child rows, scoped to org.
+
+        Deletes from child tables (audio_fingerprints, video_segments,
+        embedding_recipes, pilot_tone_index) before the parent video row
+        to satisfy foreign key constraints.
+        Returns True if the video was deleted, False if not found.
+        """
+        cid = str(content_id)
+
+        # Verify the video exists and belongs to this org before cascading
+        row = await self._session.execute(
+            select(Video.id).where(Video.content_id == cid).where(Video.org_id == org_id)
+        )
+        if row.scalar_one_or_none() is None:
+            return False
+
+        # Delete child rows referencing this content_id
+        for child in (AudioFingerprint, VideoSegment, EmbeddingRecipe, PilotToneIndex):
+            await self._session.execute(
+                sql_delete(child).where(child.content_id == cid)
+            )
+
+        # Delete the parent video row
+        await self._session.execute(
+            sql_delete(Video).where(Video.content_id == cid).where(Video.org_id == org_id)
+        )
+        await self._session.commit()
+        return True
 
     async def count_by_org_id(
         self,

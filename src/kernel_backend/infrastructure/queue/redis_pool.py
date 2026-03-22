@@ -9,4 +9,5 @@ def make_redis_settings(settings: Settings) -> RedisSettings:
         port=settings.REDIS_PORT,
         password=settings.REDIS_PASSWORD,
         ssl=settings.REDIS_SSL,
+        conn_timeout=10,
     )
