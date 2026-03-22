@@ -7,7 +7,15 @@ from pathlib import Path
 from uuid import UUID
 
 from kernel_backend.core.domain.identity import Certificate
-from kernel_backend.core.services.signing_service import sign_audio
+from kernel_backend.core.services.signing_service import (
+    _persist_payload,
+    _sign_audio_cpu,
+    _sign_av_cpu,
+    _sign_video_cpu,
+    sign_audio,
+    sign_av,
+    sign_video,
+)
 from kernel_backend.infrastructure.media.media_service import MediaService
 
 
@@ -20,16 +28,56 @@ async def _set_job_status(redis: object, job_id: str, status: dict) -> None:
     )
 
 
+def _sign_sync(
+    media_path: str,
+    cert_data: dict,
+    private_key_pem: str,
+    pepper: bytes,
+    org_id: str | None = None,
+    original_filename: str = "",
+) -> dict:
+    """Top-level picklable function — runs the CPU phase of signing in a subprocess.
+
+    Probes the media file, routes to the correct _sign_*_cpu helper, and returns
+    a RawSigningPayload dict. No async I/O, no storage writes, no DB calls.
+
+    The parent async loop (process_sign_job) runs _persist_payload() after this
+    returns to upload the signed file and save metadata to storage + registry.
+    """
+    certificate = Certificate(
+        author_id=cert_data["author_id"],
+        name=cert_data["name"],
+        institution=cert_data["institution"],
+        public_key_pem=cert_data["public_key_pem"],
+        created_at=cert_data["created_at"],
+    )
+    media = MediaService()
+    media_path_obj = Path(media_path)
+    profile = media.probe(media_path_obj)
+    parsed_org_id: UUID | None = UUID(org_id) if org_id else None
+
+    if profile.has_video and profile.has_audio:
+        return _sign_av_cpu(media_path_obj, certificate, private_key_pem, pepper, media, parsed_org_id, original_filename)
+    elif profile.has_video:
+        return _sign_video_cpu(media_path_obj, certificate, private_key_pem, pepper, media, parsed_org_id, original_filename)
+    else:
+        return _sign_audio_cpu(media_path_obj, certificate, private_key_pem, pepper, media, parsed_org_id, original_filename)
+
+
 async def process_sign_job(
     ctx: dict,
     media_path: str,
     certificate_json: str,
     private_key_pem: str,
     org_id: str | None = None,
+    org_pepper_hex: str | None = None,
+    original_filename: str = "",
 ) -> dict:
     """
-    Deserialize certificate_json → Certificate, then run sign_audio() in a
+    Deserialize certificate_json → Certificate, then run the CPU phase in a
     ProcessPoolExecutor so the CPU-bound DSP work does not block the event loop.
+    After the subprocess returns, run the I/O phase (storage + registry) in the
+    parent async loop using real adapters from ctx.
 
     Idempotent: if the content_id already exists in the registry, returns the
     stored result without re-signing.
@@ -51,11 +99,11 @@ async def process_sign_job(
 
     storage = ctx["storage"]
     registry = ctx["registry"]
-    pepper: bytes = ctx["pepper"]
+    # Use org-specific pepper when provided (Phase C); fall back to global system pepper
+    pepper: bytes = bytes.fromhex(org_pepper_hex) if org_pepper_hex else ctx["pepper"]
     process_pool = ctx.get("process_pool")
 
     loop = asyncio.get_event_loop()
-
     parsed_org_id: UUID | None = UUID(org_id) if org_id else None
 
     try:
@@ -66,13 +114,14 @@ async def process_sign_job(
             })
 
         if process_pool is not None:
-            # Progress: 20% — about to start CPU work
+            # Progress: 20% — about to start CPU work in subprocess
             if redis is not None:
                 await _set_job_status(redis, arq_job_id, {
                     "job_id": arq_job_id, "status": "processing", "progress": 20,
                 })
 
-            result = await loop.run_in_executor(
+            # CPU phase — runs in subprocess, returns RawSigningPayload dict
+            payload = await loop.run_in_executor(
                 process_pool,
                 _sign_sync,
                 media_path,
@@ -80,10 +129,19 @@ async def process_sign_job(
                 private_key_pem,
                 pepper,
                 org_id,
+                original_filename,
             )
-            # Persist via registry/storage (async, must happen in this loop)
-            # _sign_sync returns a plain dict; full storage/registry calls
-            # are handled inside sign_audio when called directly.
+
+            # I/O phase — runs in parent async loop with real storage + registry
+            await _persist_payload(payload, storage, registry)
+
+            result = {
+                "content_id": payload["content_id"],
+                "signed_media_key": payload["signed_media_key"],
+                "active_signals": payload["active_signals"],
+                "rs_n": payload["rs_n"],
+            }
+
         else:
             # Progress: 20% — about to start in-process signing
             if redis is not None:
@@ -91,17 +149,48 @@ async def process_sign_job(
                     "job_id": arq_job_id, "status": "processing", "progress": 20,
                 })
 
-            # Fallback: run in-process (dev / test)
-            signing_result = await sign_audio(
-                media_path=Path(media_path),
-                certificate=certificate,
-                private_key_pem=private_key_pem,
-                storage=storage,
-                registry=registry,
-                pepper=pepper,
-                media=MediaService(),
-                org_id=parsed_org_id,
-            )
+            # Fallback: run in-process (dev / no process pool)
+            # Routes to the correct signing function based on media type.
+            media_svc = MediaService()
+            profile = media_svc.probe(Path(media_path))
+
+            if profile.has_video and profile.has_audio:
+                signing_result = await sign_av(
+                    media_path=Path(media_path),
+                    certificate=certificate,
+                    private_key_pem=private_key_pem,
+                    storage=storage,
+                    registry=registry,
+                    pepper=pepper,
+                    media=media_svc,
+                    org_id=parsed_org_id,
+                    original_filename=original_filename,
+                )
+            elif profile.has_video:
+                signing_result = await sign_video(
+                    media_path=Path(media_path),
+                    certificate=certificate,
+                    private_key_pem=private_key_pem,
+                    storage=storage,
+                    registry=registry,
+                    pepper=pepper,
+                    media=media_svc,
+                    org_id=parsed_org_id,
+                    original_filename=original_filename,
+                )
+            else:
+                signing_result = await sign_audio(
+                    media_path=Path(media_path),
+                    certificate=certificate,
+                    private_key_pem=private_key_pem,
+                    storage=storage,
+                    registry=registry,
+                    pepper=pepper,
+                    media=media_svc,
+                    org_id=parsed_org_id,
+                    original_filename=original_filename,
+                )
+
             result = {
                 "content_id": signing_result.content_id,
                 "signed_media_key": signing_result.signed_media_key,
@@ -129,68 +218,6 @@ async def process_sign_job(
                 "error": str(exc),
             })
         raise
-
-
-def _sign_sync(
-    media_path: str,
-    cert_data: dict,
-    private_key_pem: str,
-    pepper: bytes,
-    org_id: str | None = None,
-) -> dict:
-    """Top-level picklable wrapper that runs sign_audio in a new event loop.
-
-    NOTE: storage and registry writes are performed in-process here.
-    For production, wire a real storage/registry via ctx and move them
-    back to the async layer after run_in_executor completes.
-    This simplified version is suitable for CPU-offload testing.
-    """
-    from kernel_backend.core.domain.identity import Certificate  # noqa: PLC0415
-    from kernel_backend.core.services.signing_service import sign_audio  # noqa: PLC0415
-    from kernel_backend.infrastructure.media.media_service import MediaService  # noqa: PLC0415
-
-    certificate = Certificate(
-        author_id=cert_data["author_id"],
-        name=cert_data["name"],
-        institution=cert_data["institution"],
-        public_key_pem=cert_data["public_key_pem"],
-        created_at=cert_data["created_at"],
-    )
-
-    # _sign_sync cannot use real async storage/registry —
-    # this is a placeholder; production jobs wire storage/registry via ctx.
-    from kernel_backend.infrastructure.storage.local_storage import LocalStorageAdapter  # noqa: PLC0415
-    import tempfile  # noqa: PLC0415
-
-    tmp_base = tempfile.mkdtemp()
-    storage = LocalStorageAdapter(base_path=__import__("pathlib").Path(tmp_base))
-
-    class _NullRegistry:
-        async def save_video(self, *a: object, **kw: object) -> None: ...
-        async def save_segments(self, *a: object, **kw: object) -> None: ...
-        async def get_by_content_id(self, *a: object, **kw: object): return None
-        async def get_valid_candidates(self) -> list: return []
-        async def match_fingerprints(self, *a: object, **kw: object) -> list: return []
-
-    from uuid import UUID as _UUID  # noqa: PLC0415
-    parsed_org_id = _UUID(org_id) if org_id else None
-
-    result = asyncio.run(sign_audio(
-        media_path=__import__("pathlib").Path(media_path),
-        certificate=certificate,
-        private_key_pem=private_key_pem,
-        storage=storage,
-        registry=_NullRegistry(),
-        pepper=pepper,
-        media=MediaService(),
-        org_id=parsed_org_id,
-    ))
-    return {
-        "content_id": result.content_id,
-        "signed_media_key": result.signed_media_key,
-        "active_signals": result.active_signals,
-        "rs_n": result.rs_n,
-    }
 
 
 async def process_verify_job(ctx: dict, **kwargs: object) -> None:

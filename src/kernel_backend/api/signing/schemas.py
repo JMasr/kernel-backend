@@ -23,3 +23,4 @@ class SignJobStatusResponse(BaseModel):
     status: str          # "queued" | "in_progress" | "complete" | "not_found" | "failed"
     progress: int = 0    # 0-100
     result: SignJobResult | None = None
+    error: str | None = None  # Human-readable error message when status == "failed"

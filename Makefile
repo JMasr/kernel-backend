@@ -28,7 +28,7 @@ requirements-dev: requirements
 # ── Dev server ───────────────────────────────────────────────────────────────
 .PHONY: up
 up:
-	fastapi dev main.py
+	uv run fastapi dev main.py
 
 # ── ARQ worker ───────────────────────────────────────────────────────────────
 .PHONY: worker

@@ -1,3 +1,4 @@
+import secrets
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -50,7 +51,7 @@ class OrganizationRepository(OrganizationPort):
         self._session = session
 
     async def create_organization(self, name: str) -> Organization:
-        org = OrgRecord(id=uuid.uuid4(), name=name)
+        org = OrgRecord(id=uuid.uuid4(), name=name, pepper_v1=secrets.token_hex(32))
         self._session.add(org)
         await self._session.flush()
         await self._session.refresh(org)

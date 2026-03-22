@@ -11,6 +11,8 @@ dist/
 *.key
 secrets/
 
+/node_modules
+
 # Database
 *.db
 *.sqlite3

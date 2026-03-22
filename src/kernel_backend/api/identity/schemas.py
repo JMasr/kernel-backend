@@ -10,6 +10,15 @@ class GenerateIdentityRequest(BaseModel):
     institution: str = Field(min_length=1)
 
 
+class PublicCertificateResponse(BaseModel):
+    """Public certificate fields only — no private key."""
+    author_id: str
+    name: str
+    institution: str
+    public_key_pem: str
+    created_at: str
+
+
 class CertificateResponse(BaseModel):
     author_id: str
     name: str
