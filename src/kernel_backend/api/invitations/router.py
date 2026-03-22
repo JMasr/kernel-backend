@@ -172,12 +172,16 @@ async def validate_token(
 async def accept_invitation(
     token: UUID,
     body: AcceptInvitationRequest,
+    request: Request,
     session: AsyncSession = Depends(get_session),
 ) -> InvitationResponse:
     """Accept an invitation and add the user to the organisation."""
+    # Prefer authenticated identity over body to prevent spoofing
+    authenticated_user_id: str | None = getattr(request.state, "user_id", None)
+    effective_user_id = authenticated_user_id or body.user_id
     service = _get_service(session)
     try:
-        invitation = await service.accept_invitation(token=token, user_id=body.user_id)
+        invitation = await service.accept_invitation(token=token, user_id=effective_user_id)
     except ValueError as exc:
         raise HTTPException(status_code=410, detail=str(exc))
     return _to_response(invitation)

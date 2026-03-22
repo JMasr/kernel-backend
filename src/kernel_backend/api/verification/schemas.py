@@ -24,6 +24,10 @@ class VerificationResponse(BaseModel):
     n_erasures: int                               = 0
     fingerprint_confidence: float                 = 0.0    # diagnostic only, never drives verdict
 
+    # Human-readable enrichment — resolved from DB after verification
+    author_name: str | None                          = None
+    org_name: str | None                             = None
+
     # AV-only fields — None for video-only or audio-only containers
     audio_verdict: Literal["VERIFIED", "RED"] | None = None
     video_verdict: Literal["VERIFIED", "RED"] | None = None

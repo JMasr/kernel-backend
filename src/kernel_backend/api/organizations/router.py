@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kernel_backend.api.dependencies import get_session
@@ -26,12 +26,17 @@ def _get_service(session: AsyncSession) -> OrganizationService:
 @router.post("", status_code=201, response_model=OrganizationResponse)
 async def create_organization(
     body: CreateOrganizationRequest,
-    x_user_id: str = Header(..., alias="X-User-ID"),
+    request: Request,
     session: AsyncSession = Depends(get_session),
 ) -> OrganizationResponse:
-    """Create a new organization and set the requesting user as admin."""
+    """Create a new organization. Requires master admin."""
+    if not getattr(request.state, "is_admin", False):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    user_id: str | None = getattr(request.state, "user_id", None)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
     service = _get_service(session)
-    org, _ = await service.create_organization(name=body.name, admin_user_id=x_user_id)
+    org, _ = await service.create_organization(name=body.name, admin_user_id=user_id)
     return OrganizationResponse(
         org_id=org.id,
         name=org.name,
@@ -47,12 +52,15 @@ async def create_organization(
 async def create_api_key(
     org_id: UUID,
     body: CreateApiKeyRequest,
-    x_user_id: str = Header(..., alias="X-User-ID"),
+    request: Request,
     session: AsyncSession = Depends(get_session),
 ) -> ApiKeyResponse:
     """Generate a new API key for the org. Requires admin role."""
+    user_id: str | None = getattr(request.state, "user_id", None)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
     service = _get_service(session)
-    if not await service.is_admin(org_id, x_user_id):
+    if not await service.is_admin(org_id, user_id):
         raise HTTPException(status_code=403, detail="Admin role required")
     api_key, plaintext = await service.create_api_key(org_id, name=body.name)
     return ApiKeyResponse(

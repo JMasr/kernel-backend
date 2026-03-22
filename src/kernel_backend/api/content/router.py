@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,6 +33,7 @@ class ContentListItem(BaseModel):
     author_id: str
     author_name: Optional[str] = None
     created_at: Optional[str] = None
+    filename: Optional[str] = None
 
 
 class ContentListResponse(BaseModel):
@@ -46,6 +47,43 @@ class ContentListResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+
+@router.delete("/{content_id}", status_code=204)
+async def delete_content(
+    content_id: UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Delete signed content (org-scoped, author-scoped for non-admins).
+
+    Admins can delete any content in their org.
+    Regular members can only delete their own content.
+    Returns 404 if content does not exist or belongs to a different org.
+    Storage object is NOT deleted — storage cleanup is a separate concern.
+    """
+    org_id: UUID | None = getattr(request.state, "org_id", None)
+    if org_id is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    is_admin = getattr(request.state, "is_admin", False)
+    user_id: str | None = getattr(request.state, "user_id", None)
+
+    repo = VideoRepository(session)
+
+    # Non-admin members must own the content to delete it
+    if not is_admin and user_id is not None:
+        entry = await repo.get_by_content_id(str(content_id))
+        if entry is None or entry.org_id != org_id:
+            raise HTTPException(status_code=404, detail="Content not found or access denied")
+        if entry.author_id != user_id:
+            raise HTTPException(status_code=403, detail="You can only delete your own content")
+
+    deleted = await repo.delete_by_content_id(content_id, org_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Content not found or access denied")
+
+    return Response(status_code=204)
 
 
 @router.get("/{content_id}/download", response_model=DownloadUrlResponse)
@@ -75,6 +113,11 @@ async def get_download_url(
         key=entry.signed_media_key,
         expires_in=_PRESIGNED_EXPIRY_SECONDS,
     )
+
+    # Ensure absolute URL — LocalStorageAdapter returns relative paths;
+    # R2/S3 adapters already return absolute URLs.
+    if download_url.startswith("/"):
+        download_url = str(request.base_url).rstrip("/") + download_url
 
     filename = entry.signed_media_key.rsplit("/", 1)[-1]
 
@@ -106,6 +149,12 @@ async def list_content(
     offset = (page - 1) * limit
     repo = VideoRepository(session)
 
+    # Role-aware scoping: members see only their own content; admins can filter freely.
+    is_admin = getattr(request.state, "is_admin", False)
+    user_id: str | None = getattr(request.state, "user_id", None)
+    if not is_admin and user_id is not None:
+        author_id = user_id  # force scope to caller; ignore query param
+
     rows = await repo.list_by_org_id(
         org_id=org_id,
         author_id=author_id,
@@ -120,6 +169,7 @@ async def list_content(
             author_id=entry.author_id,
             author_name=author_name,
             created_at=created_at_iso,
+            filename=entry.signed_media_key.rsplit("/", 1)[-1] if entry.signed_media_key else None,
         )
         for entry, author_name, created_at_iso in rows
     ]
