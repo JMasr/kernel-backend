@@ -8,7 +8,11 @@ import pywt
 import pytest
 
 from kernel_backend.core.domain.watermark import BandConfig
-from kernel_backend.engine.audio.wid_beacon import embed_segment, extract_segment
+from kernel_backend.engine.audio.wid_beacon import (
+    ERASURE_THRESHOLD_Z,
+    embed_segment,
+    extract_segment,
+)
 from kernel_backend.engine.codec.hopping import plan_audio_hopping
 from kernel_backend.engine.codec.reed_solomon import ReedSolomonCodec
 from kernel_backend.engine.codec.spread_spectrum import normalized_correlation, pn_sequence
@@ -49,7 +53,7 @@ def test_embed_extract_roundtrip_correlation() -> None:
     embedded = embed_segment(seg, rs_symbol=0b10101010, band_config=bc,
                               pn_seed=seed, target_snr_db=_TEST_SNR_DB)
     corr = extract_segment(embedded, bc, seed)
-    assert corr > 0.3, f"Correlation {corr:.4f} too low (expected > 0.3)"
+    assert corr > 1.0, f"Z-score {corr:.4f} too low (expected > {ERASURE_THRESHOLD_Z})"
 
 
 def test_rs_symbols_survive_roundtrip() -> None:
@@ -103,20 +107,30 @@ def test_output_length_preserved() -> None:
 
 def test_wrong_seed_gives_low_correlation() -> None:
     """
-    Different pn_seed on extraction → mean |correlation| < 0.25.
-    With correct seed at -6 dB the correlation is ~0.5; wrong seed gives ~0.14.
+    Wrong pn_seed on extraction → mean Z-score significantly lower than correct seed.
+    With correct seed at -6 dB the Z-score is >> ERASURE_THRESHOLD_Z.
+    With wrong seed, Z-score converges to the noise floor (E[|Z|] ≈ 0.8).
+    We verify wrong-seed Z-score < correct-seed Z-score (not an exact threshold,
+    since with only 8 symbols the noise floor estimate has variance).
     """
     seg = _noise_segment(0)
     bc = _default_bc(0)
     embed_seed = _pn_seed(0)
     wrong_seed = _pn_seed(99)
 
-    corrs = []
+    corrs_wrong = []
+    corrs_correct = []
     for sym in [0, 85, 170, 255, 42, 128, 200, 15]:
         embedded = embed_segment(seg, sym, bc, embed_seed, target_snr_db=_TEST_SNR_DB)
-        corr = extract_segment(embedded, bc, wrong_seed)
-        corrs.append(corr)
+        corrs_wrong.append(extract_segment(embedded, bc, wrong_seed))
+        corrs_correct.append(extract_segment(embedded, bc, embed_seed))
 
-    assert float(np.mean(corrs)) < 0.25, (
-        f"Mean |corr| with wrong seed: {np.mean(corrs):.4f} (expected < 0.25)"
+    mean_wrong = float(np.mean(corrs_wrong))
+    mean_correct = float(np.mean(corrs_correct))
+    assert mean_wrong < mean_correct, (
+        f"Wrong-seed Z ({mean_wrong:.4f}) should be < correct-seed Z ({mean_correct:.4f})"
+    )
+    # Correct seed must clearly be above the erasure threshold
+    assert mean_correct >= ERASURE_THRESHOLD_Z, (
+        f"Correct-seed Z-score {mean_correct:.4f} < ERASURE_THRESHOLD_Z {ERASURE_THRESHOLD_Z}"
     )

@@ -164,7 +164,7 @@ async def test_short_audio_raises_value_error(tmp_path: Path) -> None:
     )
     private_pem, public_pem = generate_keypair()
     cert = _make_cert(public_pem)
-    with pytest.raises(ValueError, match="Audio too short"):
+    with pytest.raises(ValueError, match="Audio is too short"):
         await sign_audio(
             media_path=short,
             certificate=cert,

@@ -177,7 +177,7 @@ async def test_sign_video_raises_on_short_video(tmp_path: Path) -> None:
     private_pem, public_pem = generate_keypair()
     cert = _make_cert(public_pem)
 
-    with pytest.raises(ValueError, match="Video too short"):
+    with pytest.raises(ValueError, match="Video is too short"):
         await sign_video(
             media_path=short,
             certificate=cert,

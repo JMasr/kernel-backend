@@ -18,7 +18,29 @@ import json
 
 from kernel_backend.core.domain.manifest import CryptographicManifest
 from kernel_backend.core.domain.verification import RedReason, VerificationResult, Verdict
-from kernel_backend.core.domain.watermark import VideoEntry
+from kernel_backend.core.domain.watermark import (
+    AudioEmbeddingParams,
+    EmbeddingParams,
+    VideoEmbeddingParams,
+    VideoEntry,
+)
+
+_TEST_EMBEDDING_PARAMS = EmbeddingParams(
+    audio=AudioEmbeddingParams(
+        dwt_levels=(1, 2),
+        chips_per_bit=256,
+        psychoacoustic=False,
+        safety_margin_db=3.0,
+        target_snr_db=-14.0,
+    ),
+    video=VideoEmbeddingParams(
+        jnd_adaptive=False,
+        qim_step_base=64.0,
+        qim_step_min=44.0,
+        qim_step_max=128.0,
+        qim_quantize_to=4.0,
+    ),
+)
 from kernel_backend.core.services.crypto_service import derive_wid, generate_keypair, sign_manifest
 from kernel_backend.core.services.verification_service import VerificationService
 from kernel_backend.engine.video.wid_watermark import WID_AGREEMENT_THRESHOLD
@@ -77,6 +99,7 @@ def _make_entry(rs_n: int = 20) -> VideoEntry:
         rs_n=rs_n,
         pilot_hash_48=0,
         manifest_signature=sig,
+        embedding_params=_TEST_EMBEDDING_PARAMS,
         manifest_json=_manifest_json_str(m),
     )
 
