@@ -37,6 +37,9 @@ data/fixtures/*.mov
 tests/fixtures/*.mp4
 tests/fixtures/*.aac
 
+# Validation output
+scripts/output/
+
 # Misc
 .DS_Store
 .idea/
