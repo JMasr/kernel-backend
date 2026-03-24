@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Generator, Iterator
+from typing import Any, Generator, Iterator
 
 import numpy as np
 
@@ -102,6 +102,24 @@ class MediaPort(ABC):
             BGR frame as uint8 ndarray, shape (H, W, 3).
         Raises:
             ValueError if time_s is beyond the video duration or frame is unreadable.
+        """
+
+    @abstractmethod
+    def open_video_encode_stream(
+        self,
+        width: int,
+        height: int,
+        fps: float,
+        output_path: Path,
+    ) -> Any:
+        """
+        Opens an FFmpeg subprocess to receive raw YUV frames via stdin and
+        encode them as H.264 lossless (crf=0) into output_path.
+
+        Returns the Popen object. Caller writes yuv.tobytes() per frame,
+        then calls stdin.close() and wait().
+
+        Analogous to encode_audio_stream — single-pass, no intermediate file.
         """
 
     @abstractmethod

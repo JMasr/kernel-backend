@@ -7,7 +7,32 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from kernel_backend.core.domain.identity import Certificate
-from kernel_backend.core.domain.watermark import SegmentFingerprint, VideoEntry
+from kernel_backend.core.domain.watermark import (
+    AudioEmbeddingParams,
+    EmbeddingParams,
+    VideoEmbeddingParams,
+    SegmentFingerprint,
+    VideoEntry,
+    embedding_params_to_dict,
+    embedding_params_from_dict,
+)
+
+_LEGACY_EMBEDDING_PARAMS = EmbeddingParams(
+    audio=AudioEmbeddingParams(
+        dwt_levels=(1, 2),
+        chips_per_bit=256,
+        psychoacoustic=False,
+        safety_margin_db=3.0,
+        target_snr_db=-14.0,
+    ),
+    video=VideoEmbeddingParams(
+        jnd_adaptive=False,
+        qim_step_base=64.0,
+        qim_step_min=44.0,
+        qim_step_max=128.0,
+        qim_quantize_to=4.0,
+    ),
+)
 from kernel_backend.core.ports.registry import RegistryPort
 from kernel_backend.infrastructure.database.models import (
     AudioFingerprint,
@@ -105,6 +130,11 @@ def _hamming(a: str, b: str) -> int:
 
 
 def _video_row_to_entry(row: Video) -> VideoEntry:
+    ep = (
+        embedding_params_from_dict(row.embedding_params)
+        if row.embedding_params is not None
+        else _LEGACY_EMBEDDING_PARAMS
+    )
     return VideoEntry(
         content_id=row.content_id,
         author_id=row.author_id,
@@ -113,6 +143,7 @@ def _video_row_to_entry(row: Video) -> VideoEntry:
         rs_n=row.rs_n or 0,
         pilot_hash_48=row.pilot_hash_48 or 0,
         manifest_signature=row.manifest_signature or b"",
+        embedding_params=ep,
         manifest_json=row.manifest_json or "",
         schema_version=row.schema_version,
         status=row.status or "VALID",
@@ -141,6 +172,7 @@ class VideoRepository:
                 status=entry.status,
                 org_id=entry.org_id,
                 signed_storage_key=entry.signed_media_key if entry.signed_media_key else None,
+                embedding_params=embedding_params_to_dict(entry.embedding_params),
             )
             .on_conflict_do_nothing(index_elements=["content_id"])
         )
@@ -171,6 +203,7 @@ class VideoRepository:
                 status=entry.status,
                 org_id=org_id,
                 signed_storage_key=entry.signed_media_key if entry.signed_media_key else None,
+                embedding_params=embedding_params_to_dict(entry.embedding_params),
             )
             .on_conflict_do_nothing(index_elements=["content_id"])
         )

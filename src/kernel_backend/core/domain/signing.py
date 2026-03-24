@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 from kernel_backend.core.domain.manifest import CryptographicManifest
 from kernel_backend.core.domain.watermark import WatermarkID
@@ -60,3 +60,6 @@ class RawSigningPayload(TypedDict):
 
     # Routing
     media_type: str              # "audio" | "video" | "av"
+
+    # DSP parameters used at sign time (serialized dict — see EmbeddingParams)
+    embedding_params: NotRequired[dict | None]

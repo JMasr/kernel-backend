@@ -19,6 +19,9 @@ def embed_pilot(
     global_pn_seed: int,        # HMAC(pepper, b"global_pilot_seed")[:8] as int
     chips_per_bit: int = 64,
     target_snr_db: float = -14.0,
+    perceptual_shaping: bool = True,
+    temporal_shaping: bool = True,
+    use_psychoacoustic: bool = False,
 ) -> np.ndarray:
     """
     Embed hash_48 (48 bits) into DWT approximation band (coeffs[0]).
@@ -51,16 +54,63 @@ def embed_pilot(
         band_rms = 1.0
     amplitude = band_rms * (10.0 ** (target_snr_db / 20.0))
 
+    # MPEG-1 psychoacoustic clamp: cap amplitude at the Bark-domain masking
+    # threshold for the approximation band (0–SR/4 Hz at level 2).
+    # Uses the more restrictive of the two constraints.
+    if use_psychoacoustic:
+        from kernel_backend.engine.perceptual.psychoacoustic import (
+            _BARK_EDGES_HZ,
+            _compute_bark_power_thresholds,
+            _hz_to_bark,
+        )
+        t_by_bark = _compute_bark_power_thresholds(samples, sample_rate, safety_margin_db=3.0)
+        f_high_approx = float(sample_rate) / 4.0  # approx band at level 2: 0–SR/4 Hz
+        bark_centers = _hz_to_bark((_BARK_EDGES_HZ[:-1] + _BARK_EDGES_HZ[1:]) / 2.0)
+        bark_hi = float(_hz_to_bark(np.array([f_high_approx]))[0])
+        relevant = bark_centers <= bark_hi
+        if relevant.any():
+            bark_amp = float(np.sqrt(max(float(t_by_bark[relevant].min()), 1e-20)))
+        else:
+            bark_amp = float(np.sqrt(max(float(t_by_bark.min()), 1e-20)))
+        amplitude = min(amplitude, bark_amp)
+
+    # Perceptual masking gain — concentrate energy where host signal masks it.
+    if perceptual_shaping:
+        from kernel_backend.engine.perceptual import masking_gain
+
+        sg, tm = None, None
+        if temporal_shaping:
+            from kernel_backend.engine.perceptual.jnd_model import (
+                silence_gate as compute_silence_gate,
+                temporal_masking as compute_temporal_mask,
+            )
+            sg = compute_silence_gate(band, sample_rate, dwt_level=2)
+            tm = compute_temporal_mask(band, sample_rate, dwt_level=2)
+
+        gain = masking_gain(
+            band, sample_rate, dwt_level=2,
+            alpha=0.65, min_floor=0.05,
+            silence_gate=sg, temporal_mask=tm,
+        )
+    else:
+        gain = None
+
     # Tile chip stream across the full band for extra processing gain.
     tile_count = max(1, len(band) // n_chips)
     for rep in range(tile_count):
         start = rep * n_chips
         end = start + n_chips
         if end > len(band):
-            n = len(band) - start
-            band[start:] += chips_windowed[:n] * amplitude
+            seg_len = len(band) - start
+            if gain is not None:
+                band[start:] += chips_windowed[:seg_len] * amplitude * gain[start:]
+            else:
+                band[start:] += chips_windowed[:seg_len] * amplitude
         else:
-            band[start:end] += chips_windowed * amplitude
+            if gain is not None:
+                band[start:end] += chips_windowed * amplitude * gain[start:end]
+            else:
+                band[start:end] += chips_windowed * amplitude
 
     coeffs[0] = band
     reconstructed = pywt.waverec(coeffs, "db4", mode="periodization")

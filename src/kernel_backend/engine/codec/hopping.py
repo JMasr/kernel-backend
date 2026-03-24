@@ -13,13 +13,18 @@ def plan_audio_hopping(
     content_id: str,
     author_pubkey: str,
     pepper: bytes,
+    force_levels: list[int] | None = None,
 ) -> list[BandConfig]:
     """
     Per-segment DWT band config for audio WID embedding.
-    dwt_level alternates between 1 and 2 based on HMAC-derived seed
-    to spread the signal across frequency bands.
 
-    Seed per segment i:
+    If force_levels is None (legacy): dwt_level alternates between 1 and 2
+    based on HMAC-derived seed; extra_dwt_levels == () for all segments.
+
+    If force_levels is [1, 2] (multi-band): all segments use levels 1 and 2
+    simultaneously — dwt_level=force_levels[0], extra_dwt_levels=tuple(force_levels[1:]).
+
+    Seed per segment i (legacy path):
       HMAC-SHA256(pepper, f"audio_hop|{content_id}|{author_pubkey}|{i}".encode())
     Use first 8 bytes as int for np.random.default_rng(seed).
 
@@ -29,16 +34,27 @@ def plan_audio_hopping(
     """
     configs: list[BandConfig] = []
     for i in range(n_segments):
-        msg = f"audio_hop|{content_id}|{author_pubkey}|{i}".encode()
-        digest = hmac.new(pepper, msg, hashlib.sha256).digest()
-        seed = int.from_bytes(digest[:8], "big")
-        rng = np.random.default_rng(seed)
-        dwt_level = int(rng.integers(1, 3))  # 1 or 2
-        configs.append(BandConfig(
-            segment_index=i,
-            coeff_positions=[],
-            dwt_level=dwt_level,
-        ))
+        if force_levels is not None:
+            primary = force_levels[0]
+            extra = tuple(force_levels[1:])
+            configs.append(BandConfig(
+                segment_index=i,
+                coeff_positions=[],
+                dwt_level=primary,
+                extra_dwt_levels=extra,
+            ))
+        else:
+            msg = f"audio_hop|{content_id}|{author_pubkey}|{i}".encode()
+            digest = hmac.new(pepper, msg, hashlib.sha256).digest()
+            seed = int.from_bytes(digest[:8], "big")
+            rng = np.random.default_rng(seed)
+            dwt_level = int(rng.integers(1, 3))  # 1 or 2
+            configs.append(BandConfig(
+                segment_index=i,
+                coeff_positions=[],
+                dwt_level=dwt_level,
+                extra_dwt_levels=(),
+            ))
     return configs
 
 

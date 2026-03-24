@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, UniqueConstraint, text
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, LargeBinary, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.sql import func
@@ -67,6 +67,7 @@ class Video(Base):
     manifest_signature = Column(LargeBinary, nullable=True)  # 64-byte Ed25519
     status = Column(String(20), nullable=False, server_default="VALID")
     schema_version = Column(Integer, server_default=text("2"), nullable=False)
+    embedding_params = Column(JSON, nullable=True)  # JSONB on Postgres, JSON on SQLite
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True, index=True)
 

@@ -31,12 +31,16 @@ from kernel_backend.core.domain.verification import (
 from kernel_backend.core.ports.media import MediaPort
 from kernel_backend.core.ports.registry import RegistryPort
 from kernel_backend.core.ports.storage import StoragePort
+from kernel_backend.core.domain.watermark import VideoEmbeddingParams
 from kernel_backend.core.services.crypto_service import derive_wid, verify_manifest
 from kernel_backend.engine.audio.fingerprint import (
     extract_hashes as extract_audio_hashes,
     extract_hashes_from_stream as extract_audio_hashes_from_stream,
 )
-from kernel_backend.engine.audio.wid_beacon import extract_symbol_segment as extract_audio_symbol
+from kernel_backend.engine.audio.wid_beacon import (
+    ERASURE_THRESHOLD_Z,
+    extract_symbol_segment as extract_audio_symbol,
+)
 from kernel_backend.engine.codec.hopping import plan_audio_hopping
 from kernel_backend.engine.codec.reed_solomon import ReedSolomonCodec, ReedSolomonError
 from kernel_backend.engine.video.fingerprint import (
@@ -112,6 +116,7 @@ class VerificationService:
         # Reconstruct manifest from stored JSON (needed for Ed25519 verify)
         stored_manifest = _manifest_from_json(entry.manifest_json) if entry.manifest_json else None
 
+        _video_params = entry.embedding_params.video if entry.embedding_params else None
         return await self._authenticate_wid(
             media_path=media_path,
             media=media,
@@ -124,6 +129,8 @@ class VerificationService:
             rs_n=entry.rs_n,
             pepper=pepper,
             fingerprint_confidence=confidence,
+            use_jnd_adaptive=_video_params.jnd_adaptive if _video_params else False,
+            jnd_params=_video_params,
         )
 
     async def _identify_candidate(
@@ -197,6 +204,8 @@ class VerificationService:
         rs_n: int,
         pepper: bytes,
         fingerprint_confidence: float,
+        use_jnd_adaptive: bool = False,
+        jnd_params: VideoEmbeddingParams | None = None,
     ) -> VerificationResult:
         """
         Phase B: segment iteration + RS decode + WID comparison + Ed25519 verify.
@@ -227,6 +236,8 @@ class VerificationService:
                 author_public_key,
                 seg_idx,
                 pepper,
+                use_jnd_adaptive=use_jnd_adaptive,
+                jnd_params=jnd_params,
             )
 
             if result.agreement < WID_AGREEMENT_THRESHOLD:
@@ -346,7 +357,9 @@ class VerificationService:
 
         # Phase B — extract audio WID via DSSS
         decoded_wid, decodable, n_seg, n_dec, n_era = self._extract_audio_wid(
-            media_path, media, content_id, author_public_key, entry.rs_n, pepper
+            media_path, media, content_id, author_public_key, entry.rs_n, pepper,
+            chips_per_bit=entry.embedding_params.audio.chips_per_bit,
+            force_levels=list(entry.embedding_params.audio.dwt_levels),
         )
 
         if not decodable:
@@ -465,13 +478,18 @@ class VerificationService:
         # Phase B — extract audio WID
         (audio_wid, audio_decodable,
          audio_n_seg, audio_n_dec, audio_n_era) = self._extract_audio_wid(
-            media_path, media, content_id, author_public_key, entry.rs_n, pepper
+            media_path, media, content_id, author_public_key, entry.rs_n, pepper,
+            chips_per_bit=entry.embedding_params.audio.chips_per_bit,
+            force_levels=list(entry.embedding_params.audio.dwt_levels),
         )
 
         # Phase B — extract video WID
+        _video_params = entry.embedding_params.video if entry.embedding_params else None
         (video_wid, video_decodable,
          video_n_seg, video_n_dec, video_n_era) = self._extract_video_wid(
-            media_path, media, content_id, author_public_key, entry.rs_n, pepper
+            media_path, media, content_id, author_public_key, entry.rs_n, pepper,
+            use_jnd_adaptive=_video_params.jnd_adaptive if _video_params else False,
+            jnd_params=_video_params,
         )
 
         # WID comparison (before signature — WID mismatch is more specific)
@@ -519,13 +537,21 @@ class VerificationService:
         author_public_key: str,
         rs_n: int,
         pepper: bytes,
+        chips_per_bit: int = 256,
+        force_levels: list[int] | None = None,
     ) -> tuple[bytes | None, bool, int, int, int]:
         """
         Extract audio WID via DSSS correlation over each 2-second segment.
         Returns (decoded_wid, decodable, n_segments, n_decoded, n_erasures).
         decoded_wid is None and decodable is False when RS decode fails.
+
+        chips_per_bit and force_levels should be read from entry.embedding_params.audio
+        to reconstruct the exact pipeline used at sign time.
         """
-        band_configs = plan_audio_hopping(rs_n, content_id, author_public_key, pepper)
+        band_configs = plan_audio_hopping(
+            rs_n, content_id, author_public_key, pepper,
+            force_levels=force_levels,
+        )
         symbols: list[int | None] = []
         erasure_positions: list[int] = []
         n_segments_total = 0
@@ -546,9 +572,11 @@ class VerificationService:
                 "big",
             )
 
-            symbol_byte, _conf = extract_audio_symbol(chunk, band_configs[seg_idx], pn_seed)
+            symbol_byte, mean_z = extract_audio_symbol(
+                chunk, band_configs[seg_idx], pn_seed, chips_per_bit=chips_per_bit
+            )
 
-            if symbol_byte is None:
+            if mean_z < ERASURE_THRESHOLD_Z:
                 erasure_positions.append(seg_idx)
                 symbols.append(None)
             else:
@@ -572,6 +600,8 @@ class VerificationService:
         author_public_key: str,
         rs_n: int,
         pepper: bytes,
+        use_jnd_adaptive: bool = False,
+        jnd_params: VideoEmbeddingParams | None = None,
     ) -> tuple[bytes | None, bool, int, int, int]:
         """
         Extract video WID via QIM over each 5-second segment.
@@ -592,7 +622,9 @@ class VerificationService:
 
             n_segments_total += 1
             result = extract_segment(
-                frames, content_id, author_public_key, seg_idx, pepper
+                frames, content_id, author_public_key, seg_idx, pepper,
+                use_jnd_adaptive=use_jnd_adaptive,
+                jnd_params=jnd_params,
             )
 
             if result.agreement < WID_AGREEMENT_THRESHOLD:

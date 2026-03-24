@@ -169,6 +169,33 @@ class MediaService(MediaPort):
         ]
         return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
+    def open_video_encode_stream(
+        self,
+        width: int,
+        height: int,
+        fps: float,
+        output_path: Path,
+    ):
+        """
+        Opens an FFmpeg subprocess for streaming H.264 lossless video encode.
+        Caller writes yuv.tobytes() per frame (yuvj420p full-range),
+        then calls stdin.close() and wait().
+        """
+        import subprocess
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo", "-pix_fmt", "yuvj420p",
+            "-s", f"{width}x{height}",
+            "-r", str(fps),
+            "-i", "pipe:0",
+            "-vcodec", "libx264", "-crf", "0", "-preset", "ultrafast",
+            "-pix_fmt", "yuvj420p",
+            "-loglevel", "quiet",
+            str(output_path),
+        ]
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
     def mux_video_audio(
         self,
         video_path: Path,

@@ -14,7 +14,15 @@ import numpy as np
 from kernel_backend.core.domain.identity import Certificate
 from kernel_backend.core.domain.manifest import CryptographicManifest
 from kernel_backend.core.domain.signing import RawSigningPayload, SigningResult
-from kernel_backend.core.domain.watermark import SegmentFingerprint, VideoEntry, WatermarkID
+from kernel_backend.core.domain.watermark import (
+    AudioEmbeddingParams,
+    EmbeddingParams,
+    VideoEmbeddingParams,
+    embedding_params_to_dict,
+    SegmentFingerprint,
+    VideoEntry,
+    WatermarkID,
+)
 from kernel_backend.core.ports.media import MediaPort
 from kernel_backend.core.ports.registry import RegistryPort
 from kernel_backend.core.ports.storage import StoragePort
@@ -31,7 +39,33 @@ from kernel_backend.engine.video.fingerprint import extract_hashes as extract_vi
 from kernel_backend.engine.video.pilot_tone import embed_pilot as embed_video_pilot
 from kernel_backend.engine.video.pilot_tone import pilot_hash_48 as compute_pilot_hash_48
 from kernel_backend.engine.video.fingerprint import SEGMENT_DURATION_S as VIDEO_SEGMENT_S
-from kernel_backend.engine.video.wid_watermark import embed_segment as embed_video_segment
+from kernel_backend.engine.video.wid_watermark import (
+    embed_segment as embed_video_segment,
+    embed_video_frame,
+    frame_to_yuv420,
+)
+
+
+_DEFAULT_AUDIO_PARAMS = AudioEmbeddingParams(
+    dwt_levels=(1, 2),        # multi-band S4: embed in both levels 1 and 2 simultaneously
+    chips_per_bit=32,         # calibrated WID constant (CLAUDE.md: 32 chips/bit for WID)
+    psychoacoustic=True,       # activated Sprint 2: MPEG-1 Bark-domain amplitude profile
+    safety_margin_db=3.0,
+    target_snr_db=-14.0,      # fallback when psychoacoustic=False
+)
+
+_DEFAULT_VIDEO_PARAMS = VideoEmbeddingParams(
+    jnd_adaptive=True,         # activated Sprint 3: Chou-Li JND adaptive QIM step
+    qim_step_base=64.0,
+    qim_step_min=44.0,
+    qim_step_max=128.0,
+    qim_quantize_to=4.0,
+)
+
+_DEFAULT_EMBEDDING_PARAMS = EmbeddingParams(
+    audio=_DEFAULT_AUDIO_PARAMS,
+    video=_DEFAULT_VIDEO_PARAMS,
+)
 
 
 def _make_signed_name(original_filename: str, fallback_ext: str) -> str:
@@ -104,6 +138,16 @@ async def _persist_payload(
     signature = base64.b64decode(payload["manifest_signature"])
     org_id = UUID(payload["org_id"]) if payload["org_id"] is not None else None
 
+    raw_ep = payload.get("embedding_params")
+    embedding_params = (
+        EmbeddingParams(
+            audio=AudioEmbeddingParams(**dict(raw_ep["audio"], dwt_levels=tuple(raw_ep["audio"]["dwt_levels"]))),
+            video=VideoEmbeddingParams(**raw_ep["video"]) if raw_ep.get("video") else None,
+        )
+        if raw_ep is not None
+        else _DEFAULT_EMBEDDING_PARAMS
+    )
+
     await registry.save_video(VideoEntry(
         content_id=payload["content_id"],
         author_id=payload["author_id"],
@@ -112,6 +156,7 @@ async def _persist_payload(
         rs_n=payload["rs_n"],
         pilot_hash_48=payload["pilot_hash_48"],
         manifest_signature=signature,
+        embedding_params=embedding_params,
         manifest_json=payload["manifest_json"],
         org_id=org_id,
         signed_media_key=payload["signed_media_key"],
@@ -207,7 +252,10 @@ def _sign_audio_cpu(
     )
 
     # 11–12. Hopping plan + RS symbols
-    band_configs = plan_audio_hopping(rs_n, content_id, certificate.public_key_pem, pepper)
+    band_configs = plan_audio_hopping(
+        rs_n, content_id, certificate.public_key_pem, pepper,
+        force_levels=list(_DEFAULT_AUDIO_PARAMS.dwt_levels),
+    )
     rs_symbols = ReedSolomonCodec(rs_n).encode(wid.data)
 
     # 13–15. Pass 2 Streaming: Encode and Embed
@@ -224,7 +272,10 @@ def _sign_audio_cpu(
         for seg_idx, chunk, _ in media.iter_audio_segments(
             media_path, segment_duration_s=2.0, target_sample_rate=target_sample_rate
         ):
-            chunk = embed_audio_pilot(chunk, target_sample_rate, pilot_hash_48, global_pn_seed)
+            chunk = embed_audio_pilot(
+                chunk, target_sample_rate, pilot_hash_48, global_pn_seed,
+                use_psychoacoustic=_DEFAULT_AUDIO_PARAMS.psychoacoustic,
+            )
             if seg_idx < rs_n:
                 pn_seed = int.from_bytes(
                     hmac.new(
@@ -235,7 +286,10 @@ def _sign_audio_cpu(
                     "big",
                 )
                 chunk = embed_audio_segment(
-                    chunk, rs_symbols[seg_idx], band_configs[seg_idx], pn_seed
+                    chunk, rs_symbols[seg_idx], band_configs[seg_idx], pn_seed,
+                    chips_per_bit=_DEFAULT_AUDIO_PARAMS.chips_per_bit,
+                    use_psychoacoustic=_DEFAULT_AUDIO_PARAMS.psychoacoustic,
+                    safety_margin_db=_DEFAULT_AUDIO_PARAMS.safety_margin_db,
                 )
             if encoder_proc.stdin:
                 encoder_proc.stdin.write((chunk * 32768.0).astype(np.int16).tobytes())
@@ -270,6 +324,9 @@ def _sign_audio_cpu(
         ],
         video_fingerprints=None,
         media_type="audio",
+        embedding_params=embedding_params_to_dict(
+            EmbeddingParams(audio=_DEFAULT_AUDIO_PARAMS, video=None)
+        ),
     )
 
 
@@ -333,44 +390,53 @@ def _sign_video_cpu(
     # 10. RS symbols
     rs_symbols = ReedSolomonCodec(rs_n).encode(wid.data)
 
-    # 11. Read all frames
-    all_frames, fps = media.read_video_frames(media_path)
-    frames_per_segment = int(VIDEO_SEGMENT_S * fps)
+    # 11. Get dimensions without loading frames
+    profile = media.probe(media_path)
+    fps = profile.fps
+    width, height = profile.width, profile.height
 
-    # 12. Per-segment embedding loop
-    for seg_idx in range(rs_n):
-        start_frame = seg_idx * frames_per_segment
-        end_frame = start_frame + frames_per_segment
-        if end_frame > len(all_frames):
-            break
-
-        segment_frames = all_frames[start_frame:end_frame]
-
-        for j, frame in enumerate(segment_frames):
-            segment_frames[j] = embed_video_pilot(frame, content_id, pepper)
-
-        symbol_bits = np.array(
-            [(rs_symbols[seg_idx] >> (7 - k)) & 1 for k in range(8)],
-            dtype=np.uint8,
-        )
-        segment_frames = embed_video_segment(
-            segment_frames,
-            symbol_bits,
-            content_id,
-            certificate.public_key_pem,
-            seg_idx,
-            pepper,
-        )
-        all_frames[start_frame:end_frame] = segment_frames
-
-    # 13. Write embedded video
+    # 12. Stream-encode: read one segment at a time, embed, pipe to FFmpeg
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         signed_path = Path(tmp.name)
+
+    encoder_proc = media.open_video_encode_stream(width, height, fps, signed_path)
+
     try:
-        media.write_video_frames(all_frames, fps, signed_path)
-    except Exception:
-        signed_path.unlink(missing_ok=True)
-        raise
+        for seg_idx, seg_frames, _ in media.iter_video_segments(
+            media_path,
+            segment_duration_s=VIDEO_SEGMENT_S,
+            frame_stride=1,   # signing: all frames, no striding
+        ):
+            if seg_idx >= rs_n:
+                # write remaining frames unmodified so video length is preserved
+                for frame in seg_frames:
+                    encoder_proc.stdin.write(frame_to_yuv420(frame))
+                continue
+
+            symbol_bits = np.array(
+                [(rs_symbols[seg_idx] >> (7 - k)) & 1 for k in range(8)],
+                dtype=np.uint8,
+            )
+
+            for frame in seg_frames:
+                frame = embed_video_pilot(frame, content_id, pepper)
+                frame = embed_video_frame(
+                    frame, symbol_bits, content_id,
+                    certificate.public_key_pem, seg_idx, pepper,
+                    use_jnd_adaptive=_DEFAULT_VIDEO_PARAMS.jnd_adaptive,
+                    jnd_params=_DEFAULT_VIDEO_PARAMS,
+                )
+                encoder_proc.stdin.write(frame_to_yuv420(frame))
+
+    finally:
+        if encoder_proc.stdin:
+            encoder_proc.stdin.close()
+        encoder_proc.wait()
+        if encoder_proc.returncode != 0:
+            signed_path.unlink(missing_ok=True)
+            raise ValueError(
+                f"FFmpeg video encode failed (returncode={encoder_proc.returncode})"
+            )
 
     signed_name = _make_signed_name(original_filename, ".mp4")
     storage_key = f"signed/{content_id}/{signed_name}"
@@ -397,6 +463,7 @@ def _sign_video_cpu(
             for fp in video_fingerprints
         ],
         media_type="video",
+        embedding_params=embedding_params_to_dict(_DEFAULT_EMBEDDING_PARAMS),
     )
 
 
@@ -484,7 +551,10 @@ def _sign_av_cpu(
     global_pn_seed = int.from_bytes(
         hmac.new(pepper, b"global_pilot_seed", hashlib.sha256).digest()[:8], "big"
     )
-    band_configs = plan_audio_hopping(rs_n, content_id, certificate.public_key_pem, pepper)
+    band_configs = plan_audio_hopping(
+        rs_n, content_id, certificate.public_key_pem, pepper,
+        force_levels=list(_DEFAULT_AUDIO_PARAMS.dwt_levels),
+    )
 
     # 13. Embed audio — streaming pass
     with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as tmp:
@@ -500,7 +570,10 @@ def _sign_av_cpu(
         for seg_idx, chunk, _ in media.iter_audio_segments(
             media_path, segment_duration_s=2.0, target_sample_rate=target_sample_rate
         ):
-            chunk = embed_audio_pilot(chunk, target_sample_rate, pilot_hash, global_pn_seed)
+            chunk = embed_audio_pilot(
+                chunk, target_sample_rate, pilot_hash, global_pn_seed,
+                use_psychoacoustic=_DEFAULT_AUDIO_PARAMS.psychoacoustic,
+            )
             if seg_idx < rs_n:
                 pn_seed = int.from_bytes(
                     hmac.new(
@@ -512,7 +585,10 @@ def _sign_av_cpu(
                 )
                 chunk = embed_audio_segment(
                     chunk, rs_symbols[seg_idx], band_configs[seg_idx], pn_seed,
+                    chips_per_bit=_DEFAULT_AUDIO_PARAMS.chips_per_bit,
                     target_snr_db=-6.0,  # -14 dB is destroyed by AAC 192k; -6 dB survives
+                    use_psychoacoustic=_DEFAULT_AUDIO_PARAMS.psychoacoustic,
+                    safety_margin_db=_DEFAULT_AUDIO_PARAMS.safety_margin_db,
                 )
             if encoder_proc.stdin:
                 encoder_proc.stdin.write((chunk * 32768.0).astype(np.int16).tobytes())
@@ -521,45 +597,54 @@ def _sign_av_cpu(
             encoder_proc.stdin.close()
         encoder_proc.wait()
 
-    # 14. Embed video — load all frames, embed with frame_stride=3 for efficiency
-    _VIDEO_EMBED_STRIDE = 3
+    # 14. Embed video — streaming encode, one segment at a time
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         video_signed_path = Path(tmp.name)
 
+    av_profile = media.probe(media_path)
+    av_fps = av_profile.fps
+    av_width, av_height = av_profile.width, av_profile.height
+
+    video_encoder = media.open_video_encode_stream(av_width, av_height, av_fps, video_signed_path)
     output_path: Path | None = None
     try:
-        all_frames, fps = media.read_video_frames(media_path)
-        frames_per_segment = int(VIDEO_SEGMENT_S * fps)
-
-        for seg_idx in range(rs_n):
-            start = seg_idx * frames_per_segment
-            end = min(start + frames_per_segment, len(all_frames))
-            if start >= len(all_frames):
-                break
+        for seg_idx, seg_frames, _ in media.iter_video_segments(
+            media_path,
+            segment_duration_s=VIDEO_SEGMENT_S,
+            frame_stride=1,   # signing: all frames, no striding
+        ):
+            if seg_idx >= rs_n:
+                for frame in seg_frames:
+                    video_encoder.stdin.write(frame_to_yuv420(frame))
+                continue
 
             symbol_bits = np.array(
                 [(rs_symbols[seg_idx] >> (7 - k)) & 1 for k in range(8)],
                 dtype=np.uint8,
             )
-            strided_indices = list(range(start, end, _VIDEO_EMBED_STRIDE))
-            strided_frames = [all_frames[i] for i in strided_indices]
 
-            for j, frame in enumerate(strided_frames):
-                strided_frames[j] = embed_video_pilot(frame, content_id, pepper)
+            for frame in seg_frames:
+                frame = embed_video_pilot(frame, content_id, pepper)
+                frame = embed_video_frame(
+                    frame, symbol_bits, content_id,
+                    certificate.public_key_pem, seg_idx, pepper,
+                    use_jnd_adaptive=_DEFAULT_VIDEO_PARAMS.jnd_adaptive,
+                    jnd_params=_DEFAULT_VIDEO_PARAMS,
+                )
+                video_encoder.stdin.write(frame_to_yuv420(frame))
 
-            strided_frames = embed_video_segment(
-                strided_frames,
-                symbol_bits,
-                content_id,
-                certificate.public_key_pem,
-                seg_idx,
-                pepper,
+    finally:
+        if video_encoder.stdin:
+            video_encoder.stdin.close()
+        video_encoder.wait()
+        if video_encoder.returncode != 0:
+            video_signed_path.unlink(missing_ok=True)
+            raise ValueError(
+                f"FFmpeg video encode failed in sign_av (returncode={video_encoder.returncode})"
             )
-            for j, i in enumerate(strided_indices):
-                all_frames[i] = strided_frames[j]
 
-        media.write_video_frames(all_frames, fps, video_signed_path)
-
+    output_path = None
+    try:
         # 15. Mux signed audio + signed video
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
             output_path = Path(tmp.name)
@@ -603,6 +688,7 @@ def _sign_av_cpu(
             for fp in video_fingerprints
         ],
         media_type="av",
+        embedding_params=embedding_params_to_dict(_DEFAULT_EMBEDDING_PARAMS),
     )
 
 
