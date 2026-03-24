@@ -64,7 +64,7 @@ known-first-party = ["kernel_backend"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short -m 'not email'"
 # src layout: tell pytest where the package lives
 pythonpath = ["src"]
 markers = [
@@ -73,6 +73,7 @@ markers = [
     "battery: full degradation matrix, run before release only",
     "slow: test takes more than 5 seconds",
     "boundary: import boundary enforcement tests",
+    "email: sends real emails via Resend API — run manually only",
 ]
 
 [tool.mypy]
