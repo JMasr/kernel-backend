@@ -2,15 +2,16 @@
 Email adapter smoke tests.
 
 Sends real emails via the Resend API using the verified domain
-notifications.kernelsecurity.tech. Skipped automatically when
-RESEND_API_KEY is not set in the environment.
+notifications.kernelsecurity.tech. Excluded from general test runs
+via the ``email`` marker. Run manually:
 
-Run manually:
     uv run python -m pytest tests/unit/test_email_smoke.py -v
 """
 from __future__ import annotations
 
 import pytest
+
+pytestmark = pytest.mark.email
 
 from kernel_backend.config import Settings
 from kernel_backend.infrastructure.email.resend_adapter import ResendEmailAdapter

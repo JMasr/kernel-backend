@@ -31,7 +31,7 @@ from kernel_backend.engine.video.fingerprint import (
     hamming_distance as video_hamming_distance,
 )
 from kernel_backend.engine.video.pilot_tone import embed_pilot, detect_pilot
-from kernel_backend.engine.video.wid_watermark import embed_segment, extract_segment
+from kernel_backend.engine.video.wid_watermark import embed_segment, embed_video_frame, extract_segment
 from kernel_backend.infrastructure.media.media_service import MediaService
 from tests.fixtures.polygon.registry import DatasetRegistry, VideoClip
 
@@ -461,6 +461,68 @@ def test_polygon_video_wid_h264(video_speech_clip: VideoClip, polygon: DatasetRe
     )
 
 
+@pytest.mark.polygon
+@pytest.mark.parametrize("crf", [23, 28])
+def test_polygon_video_wid_jnd_h264(
+    video_speech_clip: VideoClip, crf: int, tmp_path
+):
+    """
+    [POLYGON/BLOCKING] JND-adaptive WID survives H.264 recompression (Sprint 3).
+    Uses embed_video_frame with use_jnd_adaptive=True.
+    Checks:
+      1. PSNR of watermarked vs original >= 38 dB (perceptual quality gate)
+      2. agreement >= WID_AGREEMENT_THRESHOLD after CRF recompression
+    """
+    from kernel_backend.core.domain.watermark import VideoEmbeddingParams
+    from kernel_backend.engine.video.wid_watermark import WID_AGREEMENT_THRESHOLD
+
+    jnd_params = VideoEmbeddingParams(
+        jnd_adaptive=True,
+        qim_step_base=64.0,
+        qim_step_min=44.0,
+        qim_step_max=128.0,
+        qim_quantize_to=4.0,
+    )
+
+    media = MediaService()
+    frames, fps = media.read_video_frames(video_speech_clip.path, n_frames=30)
+    assert len(frames) >= 5, f"[{video_speech_clip.id}] not enough frames"
+
+    content_id = "polygon-wid-jnd-h264-test"
+    pubkey = "polygon-test-pubkey"
+    symbol_bits = np.array([1, 0, 1, 1, 0, 0, 1, 0], dtype=np.uint8)
+
+    embedded = [
+        embed_video_frame(
+            f, symbol_bits, content_id, pubkey, 0, PEPPER,
+            use_jnd_adaptive=True, jnd_params=jnd_params,
+        )
+        for f in frames
+    ]
+
+    # PSNR on first frame: watermark embedding distortion only (pre-H.264)
+    orig = frames[0].astype(np.float64)
+    wm = embedded[0].astype(np.float64)
+    mse = float(np.mean((orig - wm) ** 2))
+    psnr = 10.0 * np.log10(255.0 ** 2 / mse) if mse > 0 else float("inf")
+    assert psnr >= 38.0, (
+        f"[{video_speech_clip.id}] PSNR={psnr:.1f} dB < 38 dB — JND visible distortion"
+    )
+
+    # H.264 recompression via pipe (no double lossy encoding)
+    recomp = _recompress_frames(embedded, fps, crf, tmp_path)
+    assert len(recomp) > 0, "no frames after recompression"
+
+    result = extract_segment(
+        recomp, content_id, pubkey, 0, PEPPER,
+        use_jnd_adaptive=True, jnd_params=jnd_params,
+    )
+    assert result.agreement >= WID_AGREEMENT_THRESHOLD, (
+        f"[{video_speech_clip.id}] JND WID agreement after CRF {crf}: "
+        f"{result.agreement:.3f} < {WID_AGREEMENT_THRESHOLD}"
+    )
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # 7. FINGERPRINT STABILITY UNDER RESIZE (Phase 3, informational)
 # ════════════════════════════════════════════════════════════════════════════════
@@ -767,8 +829,7 @@ def test_polygon_verify_long_video_memory(video_outside_clip: VideoClip, polygon
 # ════════════════════════════════════════════════════════════════════════════════
 
 def _skip_if_video_has_no_audio(clip: "VideoClip") -> None:
-    manifest = clip._meta  # type: ignore[attr-defined]
-    if not getattr(manifest, "has_audio", False):
+    if not clip.has_audio:
         pytest.skip(f"[{clip.id}] no audio track per manifest")
 
 

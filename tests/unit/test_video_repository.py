@@ -2,7 +2,30 @@ from __future__ import annotations
 
 import pytest
 
-from kernel_backend.core.domain.watermark import SegmentFingerprint, VideoEntry
+from kernel_backend.core.domain.watermark import (
+    AudioEmbeddingParams,
+    EmbeddingParams,
+    VideoEmbeddingParams,
+    SegmentFingerprint,
+    VideoEntry,
+)
+
+_TEST_EMBEDDING_PARAMS = EmbeddingParams(
+    audio=AudioEmbeddingParams(
+        dwt_levels=(1, 2),
+        chips_per_bit=256,
+        psychoacoustic=False,
+        safety_margin_db=3.0,
+        target_snr_db=-14.0,
+    ),
+    video=VideoEmbeddingParams(
+        jnd_adaptive=False,
+        qim_step_base=64.0,
+        qim_step_min=44.0,
+        qim_step_max=128.0,
+        qim_quantize_to=4.0,
+    ),
+)
 from kernel_backend.infrastructure.database.repositories import VideoRepository
 
 ENTRY = VideoEntry(
@@ -13,6 +36,7 @@ ENTRY = VideoEntry(
     rs_n=32,
     pilot_hash_48=0xABCDEF012345,
     manifest_signature=b"\x00" * 64,
+    embedding_params=_TEST_EMBEDDING_PARAMS,
     schema_version=2,
     status="VALID",
 )

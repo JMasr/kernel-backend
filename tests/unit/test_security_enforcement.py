@@ -13,6 +13,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from kernel_backend.api.content.router import router as content_router
 from kernel_backend.api.dependencies import get_session
+from kernel_backend.core.domain.media import MediaProfile
+
+_VALID_AUDIO_PROFILE = MediaProfile(
+    has_video=False, has_audio=True, width=0, height=0,
+    fps=0.0, duration_s=60.0, sample_rate=44100,
+)
 
 _ORG_ID = UUID("00000000-0000-0000-0000-000000000001")
 _USER_A = "user_alice_123"
@@ -163,15 +169,19 @@ class TestSignOwnershipCheck:
 
         cert = {"author_id": _USER_A, "name": "Alice", "institution": "Lab", "public_key_pem": "pem", "created_at": "2025-01-01"}
 
-        with TestClient(app, raise_server_exceptions=False) as client:
-            response = client.post(
-                "/sign",
-                files={"file": ("test.aac", BytesIO(b"x" * 100), "audio/aac")},
-                data={
-                    "certificate_json": json.dumps(cert),
-                    "private_key_pem": "private_pem",
-                },
-            )
+        with patch(
+            "kernel_backend.infrastructure.media.media_service.MediaService.probe",
+            return_value=_VALID_AUDIO_PROFILE,
+        ):
+            with TestClient(app, raise_server_exceptions=False) as client:
+                response = client.post(
+                    "/sign",
+                    files={"file": ("test.aac", BytesIO(b"x" * 100), "audio/aac")},
+                    data={
+                        "certificate_json": json.dumps(cert),
+                        "private_key_pem": "private_pem",
+                    },
+                )
         # Redis is None → 503 (queue unavailable), NOT 403 (auth failure)
         assert response.status_code == 503
 
@@ -226,14 +236,18 @@ class TestSignOwnershipCheck:
 
         cert = {"author_id": "any-author-id", "name": "Bot", "institution": "CI", "public_key_pem": "pem", "created_at": "2025-01-01"}
 
-        with TestClient(app, raise_server_exceptions=False) as client:
-            response = client.post(
-                "/sign",
-                files={"file": ("test.aac", BytesIO(b"x" * 100), "audio/aac")},
-                data={
-                    "certificate_json": json.dumps(cert),
-                    "private_key_pem": "private_pem",
-                },
-            )
+        with patch(
+            "kernel_backend.infrastructure.media.media_service.MediaService.probe",
+            return_value=_VALID_AUDIO_PROFILE,
+        ):
+            with TestClient(app, raise_server_exceptions=False) as client:
+                response = client.post(
+                    "/sign",
+                    files={"file": ("test.aac", BytesIO(b"x" * 100), "audio/aac")},
+                    data={
+                        "certificate_json": json.dumps(cert),
+                        "private_key_pem": "private_pem",
+                    },
+                )
         # Redis None → 503, not 403 — ownership check was skipped
         assert response.status_code == 503
