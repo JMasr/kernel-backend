@@ -72,7 +72,7 @@ class FakeRegistry(RegistryPort):
         self._segments[content_id] = existing + list(segments)
 
     async def match_fingerprints(
-        self, hashes: list[str], max_hamming: int = 10
+        self, hashes: list[str], max_hamming: int = 10, org_id=None
     ) -> list[VideoEntry]:
         from kernel_backend.engine.video.fingerprint import hamming_distance
         matches: set[str] = set()
@@ -96,16 +96,28 @@ def _make_cert(public_key_pem: str) -> Certificate:
 
 @pytest.fixture(scope="module")
 def synthetic_av_120s(tmp_path_factory) -> Path:
-    """120-second AV file — ≥17 segments for both audio (60 segs) and video (24 segs)."""
+    """120-second AV file — ≥17 segments for both audio (60 segs) and video (24 segs).
+
+    160x120 lossless (CRF 0) source chosen deliberately:
+    - Eliminates CRF 23 paradox caused by double-quantization from a CRF 28 source.
+    - 4× smaller files than 320x240 (~156 MB lossless intermediate vs 625 MB).
+    - Still provides 1200 blocks/frame, well above N_WID_BLOCKS_PER_SEGMENT=128.
+    """
     tmp = tmp_path_factory.mktemp("integ_av")
     out = tmp / "av_120s.mp4"
+    # 160x120 @ 15 fps, CRF 0 (lossless) source:
+    #   - Eliminates the CRF 23 paradox: a CRF 28 source caused double-quantization that
+    #     made CRF 23 re-encoding give LOWER WID agreement than CRF 28 re-encoding.
+    #   - 160x120 @ 15 fps keeps peak disk usage ≈ 280 MB (vs 625 MB for 320x240 @ 25 fps).
+    #   - 1200 blocks/frame well above N_WID_BLOCKS_PER_SEGMENT=128 and N_PILOT_BLOCKS=256.
+    #   - 24 video segments (120s / 5s) → RS(24,16): parity=8, t=4 errors correctable.
     subprocess.run(
         [
             "ffmpeg", "-y",
-            "-f", "lavfi", "-i", "testsrc=duration=120:size=320x240:rate=25,noise=c0s=100:allf=t",
+            "-f", "lavfi", "-i", "testsrc=duration=120:size=160x120:rate=15,noise=c0s=100:allf=t",
             "-f", "lavfi", "-i", "anoisesrc=duration=120:sample_rate=44100",
             "-ac", "1",
-            "-c:v", "libx264", "-crf", "28", "-preset", "ultrafast",
+            "-c:v", "libx264", "-crf", "0", "-preset", "ultrafast",
             "-c:a", "aac", "-ar", "44100",
             str(out),
         ],

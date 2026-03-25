@@ -84,6 +84,11 @@ def embed_segment(
                 )
                 / np.sqrt(n_bands)
             )
+            # Robustness floor: the bark model sets a psychoacoustic ceiling (maximum
+            # amplitude before the watermark becomes audible), but it can fall below
+            # what AAC/MP3 codecs destroy.  Clamp from below at the target_snr_db
+            # amplitude so codec survival is always guaranteed regardless of signal level.
+            amplitude_profile = np.maximum(amplitude_profile, amplitude)
             # tile_count * n_chips may be < len(band) when not evenly divisible;
             # use tile_count+1 and slice to exactly len(band).
             chips_tiled = np.tile(chips, tile_count + 1)[: len(band)]

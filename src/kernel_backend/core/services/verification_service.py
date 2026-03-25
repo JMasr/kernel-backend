@@ -582,8 +582,14 @@ class VerificationService:
             else:
                 symbols.append(symbol_byte)
 
+        # Pad trailing erasures: if the file is shorter than rs_n segments (e.g. trailing
+        # trim), the missing trailing segments are implicit erasures for RS decode.
+        for trailing_idx in range(n_segments_total, rs_n):
+            erasure_positions.append(trailing_idx)
+            symbols.append(None)
+
         n_erasures = len(erasure_positions)
-        n_decoded = n_segments_total - n_erasures
+        n_decoded = n_segments_total - (n_erasures - (rs_n - n_segments_total))
 
         codec = ReedSolomonCodec(rs_n)
         try:
@@ -634,8 +640,14 @@ class VerificationService:
                 symbol_byte = result.extracted_bits[0] if result.extracted_bits else 0
                 symbols.append(symbol_byte)
 
+        # Pad trailing erasures: if the file is shorter than rs_n segments (e.g. after
+        # re-encode changes duration slightly), missing trailing segments are erasures.
+        for trailing_idx in range(n_segments_total, rs_n):
+            erasure_positions.append(trailing_idx)
+            symbols.append(None)
+
         n_erasures = len(erasure_positions)
-        n_decoded = n_segments_total - n_erasures
+        n_decoded = n_segments_total - (n_erasures - (rs_n - n_segments_total))
 
         codec = ReedSolomonCodec(rs_n)
         try:
