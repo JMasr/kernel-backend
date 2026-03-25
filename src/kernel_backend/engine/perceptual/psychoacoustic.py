@@ -268,8 +268,10 @@ def masking_gain(
     if n == 0:
         return np.ones(0, dtype=np.float32)
 
-    # 1. Absolute-value envelope
+    # 1. Absolute-value envelope — sanitize NaN/inf that can appear in edge-case
+    #    DWT coefficients (e.g. very-loud or clipped audio passages).
     envelope = np.abs(dwt_band).astype(np.float64)
+    envelope = np.where(np.isfinite(envelope), envelope, 0.0)
 
     # 2. Smoothing window length (in DWT coefficients)
     coeff_rate = sample_rate / (2 ** dwt_level)

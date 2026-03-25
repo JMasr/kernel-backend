@@ -77,7 +77,7 @@ class FakeRegistry(RegistryPort):
         self._segments[content_id] = existing + list(segments)
 
     async def match_fingerprints(
-        self, hashes: list[str], max_hamming: int = 10
+        self, hashes: list[str], max_hamming: int = 10, org_id=None
     ) -> list[VideoEntry]:
         return []
 

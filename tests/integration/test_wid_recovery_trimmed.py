@@ -80,7 +80,7 @@ class FakeRegistry(RegistryPort):
         self._segments[content_id] = existing + list(segments)
 
     async def match_fingerprints(
-        self, hashes: list[str], max_hamming: int = 10
+        self, hashes: list[str], max_hamming: int = 10, org_id=None
     ) -> list[VideoEntry]:
         from kernel_backend.engine.audio.fingerprint import hamming_distance
         matches: set[str] = set()
@@ -151,10 +151,12 @@ async def test_audio_wid_survives_trailing_trim_50_percent(
         media=media,
     )
 
-    # Write signed bytes to temp file for trimming
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_f:
+    # Write signed bytes to temp file for trimming.
+    # sign_audio produces M4A/AAC — use .m4a extension so ffmpeg -c copy
+    # muxes to a proper M4A container instead of WAV+AAC (which breaks).
+    with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as tmp_f:
         signed_path = Path(tmp_f.name)
-    trimmed_path = tmp_path / "trimmed_60s.wav"
+    trimmed_path = tmp_path / "trimmed_60s.m4a"
     try:
         signed_bytes = await storage.get(sign_result.signed_media_key)
         signed_path.write_bytes(signed_bytes)
@@ -218,9 +220,9 @@ async def test_audio_wid_survives_trailing_trim_25_percent(
         media=media,
     )
 
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_f:
+    with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as tmp_f:
         signed_path = Path(tmp_f.name)
-    trimmed_path = tmp_path / "trimmed_90s.wav"
+    trimmed_path = tmp_path / "trimmed_90s.m4a"
     try:
         signed_bytes = await storage.get(sign_result.signed_media_key)
         signed_path.write_bytes(signed_bytes)

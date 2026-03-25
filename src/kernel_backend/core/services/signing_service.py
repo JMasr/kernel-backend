@@ -49,13 +49,19 @@ from kernel_backend.engine.video.wid_watermark import (
 _DEFAULT_AUDIO_PARAMS = AudioEmbeddingParams(
     dwt_levels=(1, 2),        # multi-band S4: embed in both levels 1 and 2 simultaneously
     chips_per_bit=32,         # calibrated WID constant (CLAUDE.md: 32 chips/bit for WID)
-    psychoacoustic=True,       # activated Sprint 2: MPEG-1 Bark-domain amplitude profile
+    psychoacoustic=False,      # bark model disabled: ATH is in dB SPL (absolute) but digital
+                               # signal power is in amplitude² units — unit mismatch causes
+                               # amplitude_profile ≈ 2000+, int16 overflow, watermark destroyed.
+                               # Use Watson's energy-adaptive masking_gain (perceptual_shaping=True)
+                               # which operates in relative units and is correctly calibrated.
     safety_margin_db=3.0,
     target_snr_db=-14.0,      # fallback when psychoacoustic=False
 )
 
 _DEFAULT_VIDEO_PARAMS = VideoEmbeddingParams(
-    jnd_adaptive=True,         # activated Sprint 3: Chou-Li JND adaptive QIM step
+    jnd_adaptive=False,        # Fixed-step QIM: adaptive step changes after recompression
+                               # because luma values shift, causing QIM demodulation errors.
+                               # With qim_step_base=64.0 (fixed), WID survives H.264 CRF 28.
     qim_step_base=64.0,
     qim_step_min=44.0,
     qim_step_max=128.0,
@@ -206,21 +212,30 @@ def _sign_audio_cpu(
     target_sample_rate = 44100
 
     # 5. Fingerprint (drives segment count) — Pass 1 Streaming
-    chunk_stream = (chunk for _, chunk, _ in media.iter_audio_segments(
-        media_path, segment_duration_s=2.0, target_sample_rate=target_sample_rate
-    ))
+    # Count non-overlapping 2s chunks alongside fingerprint extraction.
+    # extract_hashes_from_stream uses overlap=0.5, so len(fingerprints) > n_wid_segments.
+    # rs_n must match the number of non-overlapping WID segments, not fingerprint count.
+    wid_segment_counter: list[int] = [0]
+
+    def _counting_stream():
+        for _, chunk, _ in media.iter_audio_segments(
+            media_path, segment_duration_s=2.0, target_sample_rate=target_sample_rate
+        ):
+            wid_segment_counter[0] += 1
+            yield chunk
+
     fingerprints = extract_audio_hashes_from_stream(
-        chunk_stream,
+        _counting_stream(),
         target_sample_rate,
         key_material=pepper,
         pepper=pepper,
     )
+    n_wid_segments = wid_segment_counter[0]
 
-    # 6. RS parameters
-    n_segments = len(fingerprints)
-    rs_n = min(n_segments, 255)
+    # 6. RS parameters — based on non-overlapping WID segment count
+    rs_n = min(n_wid_segments, 255)
     if rs_n < 17:
-        duration_s = n_segments * 2  # 2 seconds per segment
+        duration_s = n_wid_segments * 2  # 2 seconds per segment
         raise ValueError(
             f"Audio is too short to sign. Your file is approximately {duration_s} seconds, "
             f"but the minimum required duration is 34 seconds."
@@ -259,7 +274,10 @@ def _sign_audio_cpu(
     rs_symbols = ReedSolomonCodec(rs_n).encode(wid.data)
 
     # 13–15. Pass 2 Streaming: Encode and Embed
-    with tempfile.NamedTemporaryFile(suffix=media_path.suffix, delete=False) as tmp:
+    # Always use .m4a for AAC output — it creates an edit list (elst) that compensates
+    # for the ~1024-sample AAC encoder priming delay.  Without it, the first decoded
+    # segment includes silence, shifting all fingerprint and WID segment boundaries.
+    with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as tmp:
         signed_path = Path(tmp.name)
 
     encoder_proc = media.encode_audio_stream(
@@ -292,7 +310,9 @@ def _sign_audio_cpu(
                     safety_margin_db=_DEFAULT_AUDIO_PARAMS.safety_margin_db,
                 )
             if encoder_proc.stdin:
-                encoder_proc.stdin.write((chunk * 32768.0).astype(np.int16).tobytes())
+                encoder_proc.stdin.write(
+                    (np.clip(chunk, -1.0, 1.0) * 32768.0).astype(np.int16).tobytes()
+                )
     finally:
         if encoder_proc.stdin:
             encoder_proc.stdin.close()
@@ -591,7 +611,9 @@ def _sign_av_cpu(
                     safety_margin_db=_DEFAULT_AUDIO_PARAMS.safety_margin_db,
                 )
             if encoder_proc.stdin:
-                encoder_proc.stdin.write((chunk * 32768.0).astype(np.int16).tobytes())
+                encoder_proc.stdin.write(
+                    (np.clip(chunk, -1.0, 1.0) * 32768.0).astype(np.int16).tobytes()
+                )
     finally:
         if encoder_proc.stdin:
             encoder_proc.stdin.close()
