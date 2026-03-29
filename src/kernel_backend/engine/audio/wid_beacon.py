@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pywt
 
+from kernel_backend.core.domain.dsp_manifest import PRODUCTION_MANIFEST as _M
 from kernel_backend.core.domain.watermark import BandConfig
 from kernel_backend.engine.codec.spread_spectrum import (
     accumulated_bit_decisions,
@@ -16,9 +17,7 @@ from kernel_backend.engine.codec.spread_spectrum import (
 # bark_amplitude_profile_for_dwt_level, _compute_bark_power_thresholds
 
 # Z-score mean < ERASURE_THRESHOLD_Z → segment marked as erasure for RS decoder.
-# Equivalent to the old 0.10 correlation threshold in normalised-correlation scale.
-# Recalibrate empirically with scripts/listening_test.py if needed.
-ERASURE_THRESHOLD_Z: float = 1.0
+ERASURE_THRESHOLD_Z: float = _M.audio_wid.erasure_threshold_z
 
 
 def embed_segment(
@@ -52,7 +51,6 @@ def embed_segment(
 
     all_levels = (band_config.dwt_level,) + band_config.extra_dwt_levels
     n_bands = len(all_levels)
-    reconstructed_total = np.zeros(orig_len, dtype=np.float64)
 
     # Pre-compute Bark-domain masking thresholds once per segment (Sprint 2).
     # This avoids running the STFT inside the per-level loop.
@@ -64,8 +62,17 @@ def embed_segment(
         )
         t_by_bark = _compute_bark_power_thresholds(segment, sample_rate, safety_margin_db)
 
+    # Sequential embedding: each level is embedded on the result of the previous
+    # level's DWT→modify→IDWT cycle.  DWT is linear, so the watermark from level N
+    # passes through the level N+1 decomposition/reconstruction unmodified (it
+    # occupies frequency bands that the deeper decomposition doesn't resplit).
+    # This avoids the previous accumulate-and-divide bug where dividing by n_bands
+    # attenuated the watermark by an additional factor of 1/n_bands on top of the
+    # intended 1/sqrt(n_bands) energy conservation scaling.
+    result = segment.astype(np.float64)
+
     for level in all_levels:
-        coeffs = pywt.wavedec(segment.astype(np.float64), "db4", level=level, mode="periodization")
+        coeffs = pywt.wavedec(result, "db4", level=level, mode="periodization")
         band = coeffs[-2].copy()
 
         band_rms = float(np.sqrt(np.mean(band ** 2)))
@@ -89,6 +96,22 @@ def embed_segment(
             # what AAC/MP3 codecs destroy.  Clamp from below at the target_snr_db
             # amplitude so codec survival is always guaranteed regardless of signal level.
             amplitude_profile = np.maximum(amplitude_profile, amplitude)
+
+            # Compose temporal shaping: silence gate + temporal mask suppress the
+            # watermark in silent/pre-transient passages even when bark profile is
+            # active.  Without this, the codec-survival floor produces constant
+            # energy through silence → audible tonal artefact.
+            if temporal_shaping:
+                from kernel_backend.engine.perceptual.jnd_model import (
+                    silence_gate as compute_silence_gate,
+                    temporal_masking as compute_temporal_mask,
+                )
+                sg = compute_silence_gate(band, sample_rate, dwt_level=level)
+                tm = compute_temporal_mask(band, sample_rate, dwt_level=level)
+                amplitude_profile *= sg[: len(amplitude_profile)]
+                tm_capped = np.minimum(tm[: len(amplitude_profile)], 1.0)
+                amplitude_profile *= tm_capped
+
             # tile_count * n_chips may be < len(band) when not evenly divisible;
             # use tile_count+1 and slice to exactly len(band).
             chips_tiled = np.tile(chips, tile_count + 1)[: len(band)]
@@ -109,6 +132,7 @@ def embed_segment(
                 band, sample_rate, dwt_level=level,
                 alpha=0.70, min_floor=0.12,
                 silence_gate=sg, temporal_mask=tm,
+                energy_floor=0.15,
             )
             for rep in range(tile_count):
                 start = rep * n_chips
@@ -131,10 +155,9 @@ def embed_segment(
                         band[start:] += chips[:remainder] * amplitude
 
         coeffs[-2] = band
-        partial = pywt.waverec(coeffs, "db4", mode="periodization")
-        reconstructed_total += _trim_or_pad(partial, orig_len)
+        result = _trim_or_pad(pywt.waverec(coeffs, "db4", mode="periodization"), orig_len)
 
-    return (reconstructed_total / n_bands).astype(np.float32)
+    return result.astype(np.float32)
 
 
 def extract_segment(

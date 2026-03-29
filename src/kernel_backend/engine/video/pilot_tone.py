@@ -30,9 +30,11 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-QIM_STEP_PILOT = 28.0          # calibrated to survive uint8 quantization + H.264 CRF 28
-N_PILOT_BLOCKS_PER_FRAME = 256  # more blocks → more votes per bit for robustness
-PILOT_AGREEMENT_THRESHOLD = 0.75
+from kernel_backend.core.domain.dsp_manifest import PRODUCTION_MANIFEST as _M
+
+QIM_STEP_PILOT = _M.video_pilot.qim_step
+N_PILOT_BLOCKS_PER_FRAME = _M.video_pilot.n_blocks_per_frame
+PILOT_AGREEMENT_THRESHOLD = _M.video_pilot.agreement_threshold
 
 
 @dataclass(frozen=True)

@@ -121,9 +121,14 @@ def _compute_bark_power_thresholds(
     sf_matrix = _spreading_matrix(bark_centers)  # (N_BARK, N_BARK)
     spread_power = sf_matrix @ bark_power         # (N_BARK, n_frames)
 
-    # 5. ATH in linear power, broadcast to all frames
-    ath_linear = 10.0 ** (_ath_db(bark_centers) / 10.0)  # (N_BARK,)
-    t_global = spread_power + ath_linear[:, np.newaxis]   # (N_BARK, n_frames)
+    # 5. Signal-driven masking threshold — ATH intentionally excluded.
+    #    ATH (Absolute Threshold of Hearing) is in dB SPL, but digital audio
+    #    has no SPL reference.  At DWT level 1 (11–22 kHz) ATH ≈ 65 dB SPL
+    #    → linear power ≈ 3.16 M → amplitude ≈ 1778, overflowing int16 and
+    #    destroying the watermark.  The spreading function alone captures
+    #    signal-driven masking; silence detection is handled separately by
+    #    jnd_model.silence_gate().
+    t_global = spread_power  # (N_BARK, n_frames)
 
     # 6. Conservative: minimum over all frames
     t_conservative = t_global.min(axis=1)  # (N_BARK,)
@@ -227,6 +232,7 @@ def masking_gain(
     min_floor: float = 0.15,
     silence_gate: np.ndarray | None = None,
     temporal_mask: np.ndarray | None = None,
+    energy_floor: float = 0.0,
 ) -> np.ndarray:
     """Compute per-coefficient masking gain for a DWT band.
 
@@ -253,16 +259,24 @@ def masking_gain(
         WID beacon callers should use ~0.12 (RS correction headroom).
     silence_gate : np.ndarray or None, optional
         Pre-computed silence gate array from ``jnd_model.silence_gate()``.
-        Composed multiplicatively before energy normalisation.
+        Composed multiplicatively before peak normalisation.
     temporal_mask : np.ndarray or None, optional
         Pre-computed temporal masking array from ``jnd_model.temporal_masking()``.
-        Composed multiplicatively before energy normalisation.
+        Composed multiplicatively before peak normalisation.
+    energy_floor : float, optional
+        Post-gate minimum gain as a fraction of peak.  Applied AFTER gate
+        composition (step 5) but BEFORE RMS normalisation (step 6).  Guarantees
+        a minimum watermark presence even in silence-gated regions, which is
+        critical for Z-score survival through lossy codecs.  Default 0.0
+        (disabled).  WID beacon uses 0.08.
 
     Returns
     -------
     np.ndarray
-        Gain array of same length as *dwt_band*, energy-normalised so
-        that ``sqrt(mean(gain**2)) ≈ 1.0``.
+        Peak-normalised gain array of same length as *dwt_band*, with
+        ``max(gain) ≈ 1.0`` and all values ∈ (0, 1.0].  Silence and
+        pre-transient regions are suppressed below 1.0; the watermark
+        never exceeds the baseline amplitude set by ``target_snr_db``.
     """
     n = len(dwt_band)
     if n == 0:
@@ -280,6 +294,7 @@ def masking_gain(
     window_len = min(window_len, n)
 
     smoothed = uniform_filter1d(envelope, size=window_len, mode="reflect")
+    smoothed = np.maximum(smoothed, 0.0)   # clamp sub-zero FP artefacts from reflect boundary
 
     # 3. Watson's power-law masking threshold
     #    alpha=0 → gain is flat (all ones); alpha=1 → gain tracks envelope
@@ -288,25 +303,41 @@ def masking_gain(
     else:
         gain = np.power(smoothed, alpha)
 
-    # 4. Floor clamp — ensure minimum gain for robustness
+    # 4. Floor clamp on raw Watson gain.
     peak = np.max(gain)
     if peak > 0.0:
         floor_value = min_floor * peak
         np.maximum(gain, floor_value, out=gain)
+    else:
+        gain = np.ones(n, dtype=np.float64)
 
-    # 4b. Compose with silence gate (multiplicative, Phase 10.B)
+    # 5. Compose with gates.
     if silence_gate is not None:
         gain *= silence_gate[:n].astype(np.float64)
 
-    # 4c. Compose with temporal mask (multiplicative, Phase 10.B)
     if temporal_mask is not None:
-        gain *= temporal_mask[:n].astype(np.float64)
+        # Cap temporal mask at 1.0: the post-transient boost (up to 1.3) would
+        # amplify the watermark above baseline, which is both audible and wrong.
+        tm_capped = np.minimum(temporal_mask[:n].astype(np.float64), 1.0)
+        gain *= tm_capped
 
-    # 5. Energy normalisation: sqrt(mean(gain^2)) → 1.0
-    rms = np.sqrt(np.mean(gain ** 2))
-    if rms > 1e-10:
+    # 5b. Post-gate energy floor.
+    #     Applied AFTER gates so silence_gate cannot undo it.  Guarantees a
+    #     minimum watermark presence for Z-score survival through lossy codecs.
+    #     RMS normalisation in step 6 still constrains total energy to 1.0.
+    if energy_floor > 0.0:
+        peak_post_gate = np.max(gain)
+        if peak_post_gate > 0.0:
+            np.maximum(gain, energy_floor * peak_post_gate, out=gain)
+
+    # 6. RMS-normalise + hard ceiling.
+    #    RMS normalisation preserves average watermark energy (needed for codec
+    #    survival on speech with lots of silence).  The hard ceiling at 1.0
+    #    ensures watermark never exceeds the amplitude set by target_snr_db.
+    #    Perceptual shaping only redistributes energy — it must not add energy.
+    rms = float(np.sqrt(np.mean(gain ** 2)))
+    if rms > 0.0:
         gain /= rms
-    else:
-        gain = np.ones(n, dtype=np.float64)
+    np.minimum(gain, 1.0, out=gain)
 
     return gain.astype(np.float32)

@@ -21,21 +21,22 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from kernel_backend.core.domain.dsp_manifest import PRODUCTION_MANIFEST as _M
 from kernel_backend.core.domain.watermark import VideoEmbeddingParams
 
-BLOCK_SIZE = 4
-QIM_STEP_WID = 64.0
-N_WID_BLOCKS_PER_SEGMENT = 128
+BLOCK_SIZE = _M.video_wid.block_size
+QIM_STEP_WID = _M.video_wid.qim_step_wid
+N_WID_BLOCKS_PER_SEGMENT = _M.video_wid.n_blocks_per_segment
 MANDATORY_COEFFS = [(0, 1), (1, 0)]
 OPTIONAL_COEFFS = [(1, 1), (0, 2)]
-WID_AGREEMENT_THRESHOLD = 0.52
+WID_AGREEMENT_THRESHOLD = _M.video_wid.agreement_threshold
 
 # Adaptive QIM step parameters (Chou-Li JND model)
-JND_BASE_LUMINANCE = 127.0     # mid-gray: JND minimum (minimum effective step)
-QIM_STEP_ADAPTIVE_BASE = 64.0  # step at mid-gray — matches fixed QIM_STEP_WID
-QIM_STEP_ADAPTIVE_MIN = 44.0   # minimum for H.264 CRF 23 survival
-QIM_STEP_ADAPTIVE_MAX = 128.0  # maximum for very dark or textured blocks
-QIM_STEP_QUANTIZE_TO = 4.0     # granularity — absorbs H.264 DC quantization noise
+JND_BASE_LUMINANCE = 127.0
+QIM_STEP_ADAPTIVE_BASE = _M.video_wid.qim_step_base
+QIM_STEP_ADAPTIVE_MIN = _M.video_wid.qim_step_min
+QIM_STEP_ADAPTIVE_MAX = _M.video_wid.qim_step_max
+QIM_STEP_QUANTIZE_TO = _M.video_wid.qim_quantize_to
 
 
 @dataclass(frozen=True)
