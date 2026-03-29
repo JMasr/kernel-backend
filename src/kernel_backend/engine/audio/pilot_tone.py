@@ -4,6 +4,7 @@ import numpy as np
 import pywt
 from scipy.signal.windows import tukey
 
+from kernel_backend.core.domain.dsp_manifest import PRODUCTION_MANIFEST as _M
 from kernel_backend.engine.codec.spread_spectrum import (
     chip_stream,
     pn_sequence,
@@ -17,8 +18,8 @@ def embed_pilot(
     sample_rate: int,
     hash_48: int,               # 48-bit int derived from content_id
     global_pn_seed: int,        # HMAC(pepper, b"global_pilot_seed")[:8] as int
-    chips_per_bit: int = 64,
-    target_snr_db: float = -14.0,
+    chips_per_bit: int = _M.audio_pilot.chips_per_bit,
+    target_snr_db: float = _M.audio_pilot.target_snr_db,
     perceptual_shaping: bool = True,
     temporal_shaping: bool = True,
     use_psychoacoustic: bool = False,
@@ -63,7 +64,7 @@ def embed_pilot(
             _compute_bark_power_thresholds,
             _hz_to_bark,
         )
-        t_by_bark = _compute_bark_power_thresholds(samples, sample_rate, safety_margin_db=3.0)
+        t_by_bark = _compute_bark_power_thresholds(samples, sample_rate, safety_margin_db=9.0)
         f_high_approx = float(sample_rate) / 4.0  # approx band at level 2: 0–SR/4 Hz
         bark_centers = _hz_to_bark((_BARK_EDGES_HZ[:-1] + _BARK_EDGES_HZ[1:]) / 2.0)
         bark_hi = float(_hz_to_bark(np.array([f_high_approx]))[0])
@@ -121,22 +122,20 @@ def detect_pilot(
     samples: np.ndarray,
     sample_rate: int,
     global_pn_seed: int,
-    chips_per_bit: int = 64,
-    threshold: float = 0.15,
+    chips_per_bit: int = _M.audio_pilot.chips_per_bit,
+    threshold: float = 1.5,
 ) -> int | None:
     """
     Decode the 48-bit hash from the DWT approximation band and return it
-    if the normalised self-coherence is >= threshold; else return None.
+    if the mean per-bit Z-score is >= threshold; else return None.
 
-    Algorithm:
-    1. Accumulate per-bit raw dot-products across all tiled repetitions.
-    2. Decode bits from the sign of each accumulated dot-product.
-    3. Reconstruct the expected chip stream from decoded bits.
-    4. Compute normalised_correlation(band_tiled, decoded_chips_tiled).
-       Because decoded_chips_i = sign(accum_i) * pn_i, the global dot-product
-       simplifies to sum_i |accum_i|, which is always positive.  For random
-       (no-pilot) data this value converges to ~0.06 (below threshold 0.15);
-       for embedded data it converges to ~10^(target_snr_db/20) ≈ 0.20.
+    Uses Z-score detection which preserves processing gain from tiling:
+    Z grows as sqrt(n_tiles), allowing reliable detection at much lower
+    embedding amplitude than normalized correlation (which cancels tiling gain).
+
+    For random (no-pilot) data, mean Z converges to ~0.80 (half-normal mean).
+    For embedded data at -26 dB over 34s (122 tiles), mean Z ≈ 4.1.
+    Default threshold 1.5 gives effectively zero false positive probability.
     """
     coeffs = pywt.wavedec(samples.astype(np.float64), "db4", level=2, mode="periodization")
     band = coeffs[0].astype(np.float32)
@@ -172,26 +171,26 @@ def detect_pilot(
     # Decode bits from sign of accumulated dot-products (MSB first).
     bits_arr = np.array([1.0 if r > 0 else 0.0 for r in per_bit_raw], dtype=np.float32)
 
-    # Reconstruct expected tiled chip stream from decoded bits.
-    decoded_chips = chip_stream(bits_arr, chips_per_bit, global_pn_seed)
-    decoded_windowed = (decoded_chips * window).astype(np.float64)
-
-    # Global dot-product: sum_i |per_bit_raw[i]| (by construction).
-    # Normalise by Euclidean norms of band and chip streams.
+    # Z-score detection: measures how many standard deviations each bit's
+    # accumulated dot product is from zero (the null hypothesis).
+    # Uses band variance as noise estimator; Z grows as sqrt(n_reps).
     tiled_len = n_reps * n_chips
-    band_tiled = band[:tiled_len].astype(np.float64)
-    ref_tiled = np.tile(decoded_windowed, n_reps)
+    band_variance = float(np.var(band[:tiled_len].astype(np.float64)))
+    if band_variance < 1e-10:
+        band_variance = 1.0
 
-    norm_band = float(np.linalg.norm(band_tiled))
-    norm_ref = float(np.linalg.norm(ref_tiled))
-    if norm_band < 1e-10 or norm_ref < 1e-10:
-        return None
+    # Per-bit noise std accounts for windowed PN: sum(window²) per bit slice
+    z_scores = np.zeros(_N_BITS, dtype=np.float64)
+    for i in range(_N_BITS):
+        bs = i * chips_per_bit
+        be = bs + chips_per_bit
+        window_sq_sum = float(np.sum(pn_windowed[bs:be] ** 2))
+        noise_std = np.sqrt(band_variance * n_reps * window_sq_sum)
+        if noise_std > 1e-10:
+            z_scores[i] = abs(per_bit_raw[i]) / noise_std
 
-    # The global dot = sum_i |per_bit_raw[i]| (always positive for decoded chips).
-    global_dot = float(np.sum(np.abs(per_bit_raw)))
-    normalised_corr = global_dot / (norm_band * norm_ref)
-
-    if normalised_corr < threshold:
+    mean_z = float(np.mean(z_scores))
+    if mean_z < threshold:
         return None
 
     # Pack decoded bits MSB-first into 48-bit int.

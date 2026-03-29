@@ -4,10 +4,10 @@
 
 ## Responsibility
 
-Video-domain watermark embedding and extraction across three layers:
-- Layer 0 (`pilot_tone.py`): 48-bit content hash via QIM on DC coefficient of 4×4 luma blocks
+Video-domain watermark embedding and extraction across two active layers:
 - Layer 1 (`wid_watermark.py`): 1 Reed-Solomon symbol per segment via QIM on 4×4 DCT AC coefficients
 - Layer 2 (`fingerprint.py`): grayscale 32×32 → zero-mean → 2D DCT → keyed projection → 64-bit hash
+- Layer 0 (`pilot_tone.py`): 48-bit content hash via QIM on DC — **removed from signing pipeline**, diagnostic only
 
 Frames are passed as `np.ndarray` BGR (OpenCV convention). No file I/O.
 
@@ -55,11 +55,11 @@ This makes block selection resolution-independent — same content_id works at a
 | Constant | Value | Target | Survives |
 |---|---|---|---|
 | `QIM_STEP_PILOT` | 28.0 | DC coefficient `(0,0)` | H.264 CRF ≤ 28 |
-| `QIM_STEP_WID` | **64.0** | AC coefficients `{(0,1),(1,0),(1,1),(0,2)}` | H.264 CRF ≤ 28 |
+| `QIM_STEP_WID` | **48.0** | AC coefficients `{(0,1),(1,0),(1,1),(0,2)}` | H.264 CRF ≤ 28 |
 
 CRF 35 pilot is xfail (informational), but passed unexpectedly (xpassed) on noise-enriched synthetic video — the noise source adds energy to AC coefficients that benefits pilot survival too.
 QIM_STEP_PILOT was calibrated iteratively: 12→20→24→28.
-QIM_STEP_WID was calibrated iteratively: 8.0→64.0 (Phase 4). 8.0 caused quantization grid capture at H.264 QP≈28.
+QIM_STEP_WID was calibrated iteratively: 8.0→64.0→48.0. 8.0 caused quantization grid capture at H.264 QP≈28. 64.0 caused visible 4×4 block artifacts; 48.0 reduces visibility while maintaining CRF 28 robustness via majority voting (12,800 votes/bit).
 
 ## write_video_frames pixel format — critical
 
@@ -71,6 +71,8 @@ QIM_STEP_WID was calibrated iteratively: 8.0→64.0 (Phase 4). 8.0 caused quanti
 ## Module contracts
 
 ### pilot_tone.py
+
+> **Not used in signing pipeline.** Kept for calibration scripts and diagnostic tests only.
 
 ```python
 embed_pilot(frame: np.ndarray, content_id: str, pepper: bytes) -> np.ndarray

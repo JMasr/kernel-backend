@@ -2,10 +2,10 @@
 
 ## Responsibility
 
-Audio-domain watermark embedding and extraction across three layers:
-- Layer 0 (pilot_tone.py): 48-bit content identifier via DSSS in DWT approximation band
+Audio-domain watermark embedding and extraction across two active layers:
 - Layer 1 (wid_beacon.py): 1 Reed-Solomon symbol per segment via DWT detail band + hopping
 - Layer 2 (fingerprint.py): speech-optimized log-mel → DCT → keyed projection → 64-bit hash (Phase 2a)
+- Layer 0 (pilot_tone.py): 48-bit content identifier via DSSS in DWT approximation band — **removed from signing pipeline**, kept for diagnostic scripts only
 
 All functions operate on `np.ndarray` float32 samples in [-1.0, 1.0].
 No file I/O — raw samples in, raw samples out.
@@ -18,9 +18,18 @@ MAY import: `numpy`, `scipy`, `pywt`, `reedsolo`, `engine/codec/`
 ## DWT configuration
 
 - Wavelet: `db4`, level 2
-- Target band (Layer 1): `coeffs[-2]` (detail level 2, ~5.5–11 kHz at 44.1 kHz)
-- Pilot band (Layer 0): `coeffs[0]` (approximation, lowest frequency — max robustness)
+- Target band (Layer 1): `coeffs[-2]` at level 2 = cD2 (~5.5–11 kHz at 44.1 kHz)
+- Pilot band (Layer 0): `coeffs[0]` at level 2 = cA2 (approximation, 0–5.5 kHz — max robustness)
 - Reconstruction: `pywt.waverec(..., mode="periodization")`, trim/pad to original length
+
+**`coeffs[-2]` band mapping by DWT level:**
+| Level | `coeffs[-2]` | Frequency range | Audibility |
+|-------|-------------|----------------|------------|
+| 1 | cA1 (approximation) | 0–11 kHz | HIGH — includes 1–5 kHz peak sensitivity |
+| 2 | cD2 (detail) | 5.5–11 kHz | LOW — strong psychoacoustic masking |
+
+Production uses `dwt_levels=(2,)` — single-band cD2 only. Multi-band `(1, 2)` was removed
+because level-1 approximation band (0–11 kHz) produces audible modulation noise in speech.
 
 ## Module contracts
 
@@ -29,11 +38,17 @@ MAY import: `numpy`, `scipy`, `pywt`, `reedsolo`, `engine/codec/`
 ```python
 embed_pilot(samples: np.ndarray, sample_rate: int, hash_48: int,
             global_pn_seed: int, chips_per_bit: int = 64,
-            target_snr_db: float = -14.0) -> np.ndarray
+            target_snr_db: float = -14.0,
+            perceptual_shaping: bool = True,
+            temporal_shaping: bool = True,
+            use_psychoacoustic: bool = False) -> np.ndarray
 
 detect_pilot(samples: np.ndarray, sample_rate: int,
              global_pn_seed: int, chips_per_bit: int = 64,
-             threshold: float = 0.15) -> int | None  # returns 48-bit hash or None
+             threshold: float = 1.5) -> int | None
+# Z-score detection: threshold 1.5. For no-pilot data, mean Z ≈ 0.80.
+# At -26 dB over 34s (122 tiles), mean Z ≈ 4.1.
+# Pilot is NOT used in verification — only in calibration scripts.
 ```
 
 ### wid_beacon.py
@@ -41,21 +56,30 @@ detect_pilot(samples: np.ndarray, sample_rate: int,
 ```python
 embed_segment(segment: np.ndarray, rs_symbol: int,
               band_config: BandConfig, pn_seed: int,
-              chips_per_bit: int = 32,
-              target_snr_db: float = -14.0) -> np.ndarray
+              chips_per_bit: int = 256,
+              target_snr_db: float = -14.0,
+              perceptual_shaping: bool = True,
+              temporal_shaping: bool = True,
+              use_psychoacoustic: bool = False) -> np.ndarray
+# Multi-band embedding uses sequential DWT→modify→IDWT per level.
+# Amplitude scaled by 1/sqrt(n_bands) for energy conservation.
 
 extract_segment(segment: np.ndarray, band_config: BandConfig,
-                pn_seed: int, chips_per_bit: int = 32) -> float  # soft correlation [0,1]
+                pn_seed: int, chips_per_bit: int = 256) -> float
+# Returns mean Z-score (not [0,1] correlation). ERASURE_THRESHOLD_Z = 1.0.
 
 extract_symbol_segment(segment, band_config, pn_seed, chips_per_bit) -> tuple[int, float]
-# Returns (decoded_byte, confidence). Uses SIGNED correlation to decode bit=1 vs bit=0.
+# Returns (decoded_byte, mean_z). Multi-band EGC combines Z-scores across levels.
 ```
 
-**AAC survival threshold (Pre-6 finding):** The default `target_snr_db=-14.0` gives post-AAC-192k
-confidence ~0.20, which is above the 0.10 erasure threshold but only marginally. When `sign_av()`
-commits to a 192k bitrate, callers **must** pass `target_snr_db=-6.0`. At -6.0 dB, confidence
-is ~0.23 after AAC 192k and survives a second re-encode at the same bitrate.
-`sign_audio()` (256k) retains the default -14.0 dB.
+**Production parameters (signing_service.py):**
+| Context | `chips_per_bit` | `target_snr_db` | `dwt_levels` |
+|---------|----------------|----------------|-------------|
+| Audio-only WID | 32 | -20.0 | (2,) |
+| AV WID | 32 | -14.0 | (2,) |
+
+Z-score detection allows -26 dB (was -14 dB with normalized correlation).
+AV uses -22 dB (+4 dB margin for 192k AAC, more destructive than 256k).
 
 ### fingerprint.py
 
