@@ -16,7 +16,6 @@ class SigningResult:
     wid: WatermarkID
     active_signals: list[str]
     rs_n: int
-    pilot_hash_48: int
 
 
 class _FingerprintDict(TypedDict):
@@ -45,7 +44,6 @@ class RawSigningPayload(TypedDict):
 
     # DSP config
     rs_n: int
-    pilot_hash_48: int
     active_signals: list[str]
 
     # Storage

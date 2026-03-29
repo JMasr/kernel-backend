@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 import numpy as np
 
+from kernel_backend.core.domain.dsp_manifest import PRODUCTION_MANIFEST as _M
 from kernel_backend.core.domain.identity import Certificate
 from kernel_backend.core.domain.manifest import CryptographicManifest
 from kernel_backend.core.domain.signing import RawSigningPayload, SigningResult
@@ -31,13 +32,10 @@ from kernel_backend.engine.audio.fingerprint import (
     extract_hashes as extract_audio_hashes,
     extract_hashes_from_stream as extract_audio_hashes_from_stream,
 )
-from kernel_backend.engine.audio.pilot_tone import embed_pilot as embed_audio_pilot
 from kernel_backend.engine.audio.wid_beacon import embed_segment as embed_audio_segment
 from kernel_backend.engine.codec.hopping import plan_audio_hopping, plan_video_hopping
 from kernel_backend.engine.codec.reed_solomon import ReedSolomonCodec
 from kernel_backend.engine.video.fingerprint import extract_hashes as extract_video_hashes
-from kernel_backend.engine.video.pilot_tone import embed_pilot as embed_video_pilot
-from kernel_backend.engine.video.pilot_tone import pilot_hash_48 as compute_pilot_hash_48
 from kernel_backend.engine.video.fingerprint import SEGMENT_DURATION_S as VIDEO_SEGMENT_S
 from kernel_backend.engine.video.wid_watermark import (
     embed_segment as embed_video_segment,
@@ -47,25 +45,19 @@ from kernel_backend.engine.video.wid_watermark import (
 
 
 _DEFAULT_AUDIO_PARAMS = AudioEmbeddingParams(
-    dwt_levels=(1, 2),        # multi-band S4: embed in both levels 1 and 2 simultaneously
-    chips_per_bit=32,         # calibrated WID constant (CLAUDE.md: 32 chips/bit for WID)
-    psychoacoustic=False,      # bark model disabled: ATH is in dB SPL (absolute) but digital
-                               # signal power is in amplitude² units — unit mismatch causes
-                               # amplitude_profile ≈ 2000+, int16 overflow, watermark destroyed.
-                               # Use Watson's energy-adaptive masking_gain (perceptual_shaping=True)
-                               # which operates in relative units and is correctly calibrated.
-    safety_margin_db=3.0,
-    target_snr_db=-14.0,      # fallback when psychoacoustic=False
+    dwt_levels=_M.audio_wid.dwt_levels,
+    chips_per_bit=_M.audio_wid.chips_per_bit,
+    psychoacoustic=_M.audio_wid.psychoacoustic,
+    safety_margin_db=_M.audio_wid.safety_margin_db,
+    target_snr_db=_M.audio_wid.target_snr_db_audio_only,
 )
 
 _DEFAULT_VIDEO_PARAMS = VideoEmbeddingParams(
-    jnd_adaptive=False,        # Fixed-step QIM: adaptive step changes after recompression
-                               # because luma values shift, causing QIM demodulation errors.
-                               # With qim_step_base=64.0 (fixed), WID survives H.264 CRF 28.
-    qim_step_base=64.0,
-    qim_step_min=44.0,
-    qim_step_max=128.0,
-    qim_quantize_to=4.0,
+    jnd_adaptive=_M.video_wid.jnd_adaptive,
+    qim_step_base=_M.video_wid.qim_step_base,
+    qim_step_min=_M.video_wid.qim_step_min,
+    qim_step_max=_M.video_wid.qim_step_max,
+    qim_quantize_to=_M.video_wid.qim_quantize_to,
 )
 
 _DEFAULT_EMBEDDING_PARAMS = EmbeddingParams(
@@ -120,7 +112,6 @@ def _payload_to_signing_result(payload: RawSigningPayload) -> SigningResult:
         wid=WatermarkID(data=bytes.fromhex(payload["wid_hex"])),
         active_signals=payload["active_signals"],
         rs_n=payload["rs_n"],
-        pilot_hash_48=payload["pilot_hash_48"],
     )
 
 
@@ -160,7 +151,6 @@ async def _persist_payload(
         author_public_key=payload["author_public_key"],
         active_signals=payload["active_signals"],
         rs_n=payload["rs_n"],
-        pilot_hash_48=payload["pilot_hash_48"],
         manifest_signature=signature,
         embedding_params=embedding_params,
         manifest_json=payload["manifest_json"],
@@ -258,15 +248,7 @@ def _sign_audio_cpu(
     # 9. Derive WID
     wid = derive_wid(signature, content_id)
 
-    # 10. Pilot seed
-    pilot_hash_48 = int.from_bytes(
-        hashlib.sha256(content_id.encode()).digest()[:6], "big"
-    )
-    global_pn_seed = int.from_bytes(
-        hmac.new(pepper, b"global_pilot_seed", hashlib.sha256).digest()[:8], "big"
-    )
-
-    # 11–12. Hopping plan + RS symbols
+    # 10–11. Hopping plan + RS symbols
     band_configs = plan_audio_hopping(
         rs_n, content_id, certificate.public_key_pem, pepper,
         force_levels=list(_DEFAULT_AUDIO_PARAMS.dwt_levels),
@@ -290,10 +272,6 @@ def _sign_audio_cpu(
         for seg_idx, chunk, _ in media.iter_audio_segments(
             media_path, segment_duration_s=2.0, target_sample_rate=target_sample_rate
         ):
-            chunk = embed_audio_pilot(
-                chunk, target_sample_rate, pilot_hash_48, global_pn_seed,
-                use_psychoacoustic=_DEFAULT_AUDIO_PARAMS.psychoacoustic,
-            )
             if seg_idx < rs_n:
                 pn_seed = int.from_bytes(
                     hmac.new(
@@ -306,8 +284,8 @@ def _sign_audio_cpu(
                 chunk = embed_audio_segment(
                     chunk, rs_symbols[seg_idx], band_configs[seg_idx], pn_seed,
                     chips_per_bit=_DEFAULT_AUDIO_PARAMS.chips_per_bit,
-                    use_psychoacoustic=_DEFAULT_AUDIO_PARAMS.psychoacoustic,
-                    safety_margin_db=_DEFAULT_AUDIO_PARAMS.safety_margin_db,
+                    target_snr_db=_DEFAULT_AUDIO_PARAMS.target_snr_db,  # -26 dB; Z-score tiling gain
+                    use_psychoacoustic=False,  # bark model non-functional (STFT/DWT unit mismatch)
                 )
             if encoder_proc.stdin:
                 encoder_proc.stdin.write(
@@ -320,7 +298,7 @@ def _sign_audio_cpu(
 
     signed_name = _make_signed_name(original_filename, media_path.suffix)
     storage_key = f"signed/{content_id}/{signed_name}"
-    active_signals = ["pilot_audio", "wid_audio", "fingerprint_audio"]
+    active_signals = ["wid_audio", "fingerprint_audio"]
 
     return RawSigningPayload(
         content_id=content_id,
@@ -332,7 +310,6 @@ def _sign_audio_cpu(
         manifest_signature=base64.b64encode(signature).decode("ascii"),
         wid_hex=wid.data.hex(),
         rs_n=rs_n,
-        pilot_hash_48=pilot_hash_48,
         active_signals=active_signals,
         storage_key=storage_key,
         signed_media_key=storage_key,
@@ -369,10 +346,7 @@ def _sign_video_cpu(
     content_id = str(uuid4())
     content_hash = hashlib.sha256(media_path.read_bytes()).hexdigest()
 
-    # 4. Pilot hash
-    pilot_hash = compute_pilot_hash_48(content_id)
-
-    # 5. Video fingerprint (drives segment count)
+    # 4. Video fingerprint (drives segment count)
     video_fingerprints = extract_video_hashes(
         str(media_path),
         key_material=pepper,
@@ -390,7 +364,7 @@ def _sign_video_cpu(
         )
 
     # 7. Manifest
-    active_signals = ["video_pilot", "video_wid", "video_fingerprint"]
+    active_signals = ["video_wid", "video_fingerprint"]
     manifest = CryptographicManifest(
         content_id=content_id,
         content_hash_sha256=content_hash,
@@ -439,7 +413,6 @@ def _sign_video_cpu(
             )
 
             for frame in seg_frames:
-                frame = embed_video_pilot(frame, content_id, pepper)
                 frame = embed_video_frame(
                     frame, symbol_bits, content_id,
                     certificate.public_key_pem, seg_idx, pepper,
@@ -471,7 +444,6 @@ def _sign_video_cpu(
         manifest_signature=base64.b64encode(signature).decode("ascii"),
         wid_hex=wid.data.hex(),
         rs_n=rs_n,
-        pilot_hash_48=pilot_hash,
         active_signals=active_signals,
         storage_key=storage_key,
         signed_media_key=storage_key,
@@ -509,10 +481,7 @@ def _sign_av_cpu(
     content_id = str(uuid4())
     content_hash = hashlib.sha256(media_path.read_bytes()).hexdigest()
 
-    # 4. Pilot hash (video)
-    pilot_hash = compute_pilot_hash_48(content_id)
-
-    # 5. Audio fingerprints (streaming — avoids loading all audio into memory)
+    # 4. Audio fingerprints (streaming — avoids loading all audio into memory)
     target_sample_rate = 44100
     chunk_stream = (chunk for _, chunk, _ in media.iter_audio_segments(
         media_path, segment_duration_s=2.0, target_sample_rate=target_sample_rate
@@ -545,8 +514,8 @@ def _sign_av_cpu(
 
     # 8. Single manifest covering BOTH channels
     active_signals = [
-        "audio_pilot", "audio_wid", "audio_fingerprint",
-        "video_pilot", "video_wid", "video_fingerprint",
+        "audio_wid", "audio_fingerprint",
+        "video_wid", "video_fingerprint",
     ]
     manifest = CryptographicManifest(
         content_id=content_id,
@@ -567,10 +536,7 @@ def _sign_av_cpu(
     # 11. Shared RS codeword
     rs_symbols = ReedSolomonCodec(rs_n).encode(wid.data)
 
-    # 12. Audio pilot seed
-    global_pn_seed = int.from_bytes(
-        hmac.new(pepper, b"global_pilot_seed", hashlib.sha256).digest()[:8], "big"
-    )
+    # 12. Audio hopping plan
     band_configs = plan_audio_hopping(
         rs_n, content_id, certificate.public_key_pem, pepper,
         force_levels=list(_DEFAULT_AUDIO_PARAMS.dwt_levels),
@@ -590,10 +556,6 @@ def _sign_av_cpu(
         for seg_idx, chunk, _ in media.iter_audio_segments(
             media_path, segment_duration_s=2.0, target_sample_rate=target_sample_rate
         ):
-            chunk = embed_audio_pilot(
-                chunk, target_sample_rate, pilot_hash, global_pn_seed,
-                use_psychoacoustic=_DEFAULT_AUDIO_PARAMS.psychoacoustic,
-            )
             if seg_idx < rs_n:
                 pn_seed = int.from_bytes(
                     hmac.new(
@@ -606,9 +568,10 @@ def _sign_av_cpu(
                 chunk = embed_audio_segment(
                     chunk, rs_symbols[seg_idx], band_configs[seg_idx], pn_seed,
                     chips_per_bit=_DEFAULT_AUDIO_PARAMS.chips_per_bit,
-                    target_snr_db=-6.0,  # -14 dB is destroyed by AAC 192k; -6 dB survives
-                    use_psychoacoustic=_DEFAULT_AUDIO_PARAMS.psychoacoustic,
-                    safety_margin_db=_DEFAULT_AUDIO_PARAMS.safety_margin_db,
+                    target_snr_db=-14.0,  # AV uses 192k AAC; must survive double-AAC (192k→128k).
+                                          # -14 dB gives post-double-AAC Z≈2.2 (threshold 1.0).
+                                          # Interim value — recalibration sprint will fine-tune.
+                    use_psychoacoustic=False,  # bark model non-functional (STFT/DWT unit mismatch)
                 )
             if encoder_proc.stdin:
                 encoder_proc.stdin.write(
@@ -646,7 +609,6 @@ def _sign_av_cpu(
             )
 
             for frame in seg_frames:
-                frame = embed_video_pilot(frame, content_id, pepper)
                 frame = embed_video_frame(
                     frame, symbol_bits, content_id,
                     certificate.public_key_pem, seg_idx, pepper,
@@ -695,7 +657,6 @@ def _sign_av_cpu(
         manifest_signature=base64.b64encode(signature).decode("ascii"),
         wid_hex=wid.data.hex(),
         rs_n=rs_n,
-        pilot_hash_48=pilot_hash,
         active_signals=active_signals,
         storage_key=storage_key,
         signed_media_key=storage_key,
