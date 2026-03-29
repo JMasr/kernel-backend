@@ -59,9 +59,8 @@ class VideoEntry:
     content_id: str
     author_id: str
     author_public_key: str
-    active_signals: list[str]   # e.g. ["pilot_audio", "wid_audio", "fingerprint_audio"]
+    active_signals: list[str]   # e.g. ["wid_audio", "fingerprint_audio"]
     rs_n: int                   # total RS symbols used at sign time
-    pilot_hash_48: int          # 48-bit int for fast pilot index lookup
     manifest_signature: bytes   # 64-byte Ed25519 signature — stored for WID re-derivation
     embedding_params: EmbeddingParams  # DSP parameters used at sign time
     manifest_json: str = ""     # canonical manifest JSON — stored for signature verification
@@ -94,7 +93,6 @@ class BandConfig:
 class EmbeddingRecipe:
     content_id: str
     rs_n: int
-    pilot_hash_48: bytes
     band_configs: list[BandConfig]
     prng_seeds: list[int]
     rs_k: int = 16
