@@ -19,11 +19,11 @@ from kernel_backend.core.domain.watermark import (
 
 _LEGACY_EMBEDDING_PARAMS = EmbeddingParams(
     audio=AudioEmbeddingParams(
-        dwt_levels=(1, 2),
-        chips_per_bit=256,
+        dwt_levels=(2,),
+        chips_per_bit=32,
         psychoacoustic=False,
-        safety_margin_db=3.0,
-        target_snr_db=-14.0,
+        safety_margin_db=12.0,
+        target_snr_db=-26.0,
     ),
     video=VideoEmbeddingParams(
         jnd_adaptive=False,
@@ -38,7 +38,6 @@ from kernel_backend.infrastructure.database.models import (
     AudioFingerprint,
     EmbeddingRecipe,
     Identity,
-    PilotToneIndex,
     Video,
     VideoSegment,
 )
@@ -141,7 +140,6 @@ def _video_row_to_entry(row: Video) -> VideoEntry:
         author_public_key=row.author_public_key or "",
         active_signals=json.loads(row.active_signals_json or "[]"),
         rs_n=row.rs_n or 0,
-        pilot_hash_48=row.pilot_hash_48 or 0,
         manifest_signature=row.manifest_signature or b"",
         embedding_params=ep,
         manifest_json=row.manifest_json or "",
@@ -165,7 +163,6 @@ class VideoRepository:
                 author_public_key=entry.author_public_key,
                 active_signals_json=json.dumps(entry.active_signals),
                 rs_n=entry.rs_n,
-                pilot_hash_48=entry.pilot_hash_48,
                 manifest_signature=entry.manifest_signature,
                 manifest_json=entry.manifest_json if entry.manifest_json else None,
                 schema_version=entry.schema_version,
@@ -196,7 +193,6 @@ class VideoRepository:
                 author_public_key=entry.author_public_key,
                 active_signals_json=json.dumps(entry.active_signals),
                 rs_n=entry.rs_n,
-                pilot_hash_48=entry.pilot_hash_48,
                 manifest_signature=entry.manifest_signature,
                 manifest_json=entry.manifest_json if entry.manifest_json else None,
                 schema_version=entry.schema_version,
@@ -325,7 +321,7 @@ class VideoRepository:
             return False
 
         # Delete child rows referencing this content_id
-        for child in (AudioFingerprint, VideoSegment, EmbeddingRecipe, PilotToneIndex):
+        for child in (AudioFingerprint, VideoSegment, EmbeddingRecipe):
             await self._session.execute(
                 sql_delete(child).where(child.content_id == cid)
             )

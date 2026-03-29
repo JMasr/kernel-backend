@@ -63,7 +63,6 @@ class Video(Base):
     manifest_json = Column(Text, nullable=True)
     active_signals_json = Column(Text, nullable=True)       # JSON list[str]
     rs_n = Column(Integer, nullable=True)
-    pilot_hash_48 = Column(BigInteger, nullable=True)        # 48-bit int
     manifest_signature = Column(LargeBinary, nullable=True)  # 64-byte Ed25519
     status = Column(String(20), nullable=False, server_default="VALID")
     schema_version = Column(Integer, server_default=text("2"), nullable=False)
@@ -79,7 +78,6 @@ class EmbeddingRecipe(Base):
     content_id = Column(String, ForeignKey("videos.content_id"), nullable=False, index=True)
     rs_n = Column(Integer, nullable=False)
     rs_k = Column(Integer, default=16, nullable=False)
-    pilot_hash_48 = Column(LargeBinary, nullable=False)
     prng_seeds_json = Column(Text, nullable=False)
     band_configs_json = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -94,16 +92,6 @@ class VideoSegment(Base):
     start_time_s = Column(Float, nullable=False)
     end_time_s = Column(Float, nullable=False)
     rs_codeword = Column(LargeBinary, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-
-class PilotToneIndex(Base):
-    __tablename__ = "pilot_tone_index"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    content_id = Column(String, ForeignKey("videos.content_id"), nullable=False, index=True)
-    pilot_hash_48 = Column(LargeBinary, nullable=False)
-    signal_type = Column(String, nullable=False)  # "audio" | "video"
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
