@@ -162,18 +162,8 @@ def test_different_speakers_discriminated(golden_speech):
 # Non-blocking: failures noted but do not prevent Phase 3.
 # ════════════════════════════════════════════════════════════════════════════════
 
-@pytest.mark.xfail(
-    reason="Synthetic signals are informational only. "
-           "Speech tests are the release gate.",
-    strict=False,
-)
 def test_synthetic_discriminable_informational():
-    """
-    [INFORMATIONAL] white_noise vs multitone_dwt discrimination.
-    May fail after speech-frequency filterbank (f_min=300, f_max=8000)
-    because multitone_dwt contains energy at 200Hz and 15kHz — outside
-    the speech band. This is expected and acceptable.
-    """
+    """white_noise vs multitone_dwt spectral discrimination."""
     from tests.fixtures.audio_signals import multitone_dwt
     h_noise = extract_hashes(white_noise(6.0, SR), SR, KEY_A, PEPPER)
     h_tone  = extract_hashes(multitone_dwt(6.0, SR), SR, KEY_A, PEPPER)

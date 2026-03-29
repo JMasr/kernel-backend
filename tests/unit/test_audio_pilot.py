@@ -10,18 +10,26 @@ SEED = 0xDEADBEEFCAFEBABE
 WRONG_SEED = 0x1234567890ABCDEF
 
 def test_embed_detect_roundtrip_noise(audio_signal) -> None:
-    """embed_pilot → detect_pilot roundtrip on 1s white noise."""
+    """embed_pilot → detect_pilot roundtrip on 1s signal (pilot mechanism only).
+
+    Perceptual shaping is disabled so this test is isolated to the pilot
+    correlation mechanism.  Shaping-specific roundtrip tests live in
+    test_perceptual_shaping.py.
+    """
     _name, gen = audio_signal
     audio = gen(1.0, SR)
-    embedded = embed_pilot(audio, SR, HASH_48, SEED)
+    embedded = embed_pilot(audio, SR, HASH_48, SEED, perceptual_shaping=False)
     detected = detect_pilot(embedded, SR, SEED)
     assert detected == HASH_48
 
 def test_embed_detect_roundtrip_multitone(audio_signal) -> None:
-    """embed_pilot → detect_pilot roundtrip on 1s multitone (covers all DWT subbands)."""
+    """embed_pilot → detect_pilot roundtrip on 1s multitone (covers all DWT subbands).
+
+    Perceptual shaping disabled — tests the pilot correlation mechanism only.
+    """
     _name, gen = audio_signal
     audio = gen(1.0, SR)
-    embedded = embed_pilot(audio, SR, HASH_48, SEED)
+    embedded = embed_pilot(audio, SR, HASH_48, SEED, perceptual_shaping=False)
     detected = detect_pilot(embedded, SR, SEED)
     assert detected == HASH_48
 

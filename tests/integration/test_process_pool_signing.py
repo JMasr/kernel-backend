@@ -23,63 +23,12 @@ from pathlib import Path
 import pytest
 
 from kernel_backend.core.domain.identity import Certificate
-from kernel_backend.core.domain.watermark import SegmentFingerprint, VideoEntry
-from kernel_backend.core.ports.registry import RegistryPort
-from kernel_backend.core.ports.storage import StoragePort
 from kernel_backend.core.services.crypto_service import generate_keypair
 from kernel_backend.core.services.signing_service import _persist_payload
 from kernel_backend.infrastructure.queue.jobs import _sign_sync
+from tests.helpers.fakes import FakeRegistry, FakeStorage
 
 PEPPER = b"integration-test-pepper-padded!!"
-
-
-# ── Fake infrastructure ────────────────────────────────────────────────────────
-
-
-class FakeStorage(StoragePort):
-    def __init__(self) -> None:
-        self._store: dict[str, bytes] = {}
-
-    async def put(self, key: str, data: bytes, content_type: str) -> None:
-        self._store[key] = data
-
-    async def get(self, key: str) -> bytes:
-        return self._store[key]
-
-    async def delete(self, key: str) -> None:
-        self._store.pop(key, None)
-
-    async def presigned_upload_url(self, key: str, expires_in: int) -> str:
-        return f"fake://{key}"
-
-    async def presigned_download_url(self, key: str, expires_in: int) -> str:
-        return f"fake://{key}"
-
-
-class FakeRegistry(RegistryPort):
-    def __init__(self) -> None:
-        self._videos: dict[str, VideoEntry] = {}
-        self._segments: dict[str, list[SegmentFingerprint]] = {}
-
-    async def save_video(self, entry: VideoEntry) -> None:
-        self._videos[entry.content_id] = entry
-
-    async def get_by_content_id(self, content_id: str) -> VideoEntry | None:
-        return self._videos.get(content_id)
-
-    async def get_valid_candidates(self) -> list[VideoEntry]:
-        return [e for e in self._videos.values() if e.status == "VALID"]
-
-    async def save_segments(
-        self, content_id: str, segments: list[SegmentFingerprint], is_original: bool
-    ) -> None:
-        existing = self._segments.get(content_id, [])
-        self._segments[content_id] = existing + list(segments)
-
-    async def match_fingerprints(
-        self, hashes: list[str], max_hamming: int = 10, org_id=None
-    ) -> list[VideoEntry]:
-        return []
 
 
 def _cert_data(public_key_pem: str) -> dict:

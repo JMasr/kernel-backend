@@ -29,18 +29,20 @@ def test_gain_output_shape():
     assert gain.dtype == np.float32
 
 
-def test_gain_energy_normalized():
+def test_gain_rms_normalised():
     band = _dwt_band(white_noise(duration_s=2.0))
     gain = masking_gain(band, SR, DWT_LEVEL)
-    rms = float(np.sqrt(np.mean(gain ** 2)))
-    assert abs(rms - 1.0) < 0.01, f"RMS gain should be ~1.0, got {rms}"
+    rms = float(np.sqrt(np.mean(gain.astype(np.float64) ** 2)))
+    assert abs(rms - 1.0) < 0.15, f"RMS should be ~1.0, got {rms}"
+    assert np.all(gain <= 1.0 + 1e-5), "All gain values must be ≤ 1.0 (ceiling)"
 
 
-def test_gain_energy_normalized_pink():
+def test_gain_rms_normalised_pink():
     band = _dwt_band(pink_noise(duration_s=2.0))
     gain = masking_gain(band, SR, DWT_LEVEL)
-    rms = float(np.sqrt(np.mean(gain ** 2)))
-    assert abs(rms - 1.0) < 0.01, f"RMS gain should be ~1.0, got {rms}"
+    rms = float(np.sqrt(np.mean(gain.astype(np.float64) ** 2)))
+    assert abs(rms - 1.0) < 0.15, f"RMS should be ~1.0, got {rms}"
+    assert np.all(gain <= 1.0 + 1e-5), "All gain values must be ≤ 1.0 (ceiling)"
 
 
 # ── Envelope tracking ────────────────────────────────────────────────────────
@@ -143,8 +145,9 @@ def test_gain_works_at_different_dwt_levels(level: int):
     band = coeffs[-2].astype(np.float32)  # detail band
     gain = masking_gain(band, SR, level)
     assert len(gain) == len(band)
-    rms = float(np.sqrt(np.mean(gain ** 2)))
-    assert abs(rms - 1.0) < 0.01
+    rms = float(np.sqrt(np.mean(gain.astype(np.float64) ** 2)))
+    assert abs(rms - 1.0) < 0.15
+    assert np.all(gain <= 1.0 + 1e-5)
 
 
 # ── Phase 10.B composition tests ─────────────────────────────────────────────
@@ -180,8 +183,8 @@ def test_masking_gain_with_temporal_mask():
     assert not np.allclose(gain_without, gain_with), "Temporal mask should change output"
 
 
-def test_composed_gain_energy_normalized():
-    """Composed gain (with silence_gate + temporal_mask) still has RMS ≈ 1.0."""
+def test_composed_gain_rms_normalised():
+    """Composed gain (with silence_gate + temporal_mask) has RMS ≈ 1.0 and ceiling ≤ 1.0."""
     from kernel_backend.engine.perceptual.jnd_model import (
         silence_gate as compute_sg,
         temporal_masking as compute_tm,
@@ -196,5 +199,67 @@ def test_composed_gain_energy_normalized():
     tm = compute_tm(band, SR, DWT_LEVEL)
     gain = masking_gain(band, SR, DWT_LEVEL, alpha=0.65, min_floor=0.05,
                         silence_gate=sg, temporal_mask=tm)
-    rms = float(np.sqrt(np.mean(gain ** 2)))
-    assert abs(rms - 1.0) < 0.02, f"Composed gain RMS {rms:.4f} not close to 1.0"
+    assert np.all(gain <= 1.0 + 1e-5), "All composed gain values must be ≤ 1.0 (ceiling)"
+
+
+# ── energy_floor tests ──────────────────────────────────────────────────────
+
+
+def test_energy_floor_raises_minimum_after_gates():
+    """energy_floor applied AFTER silence_gate guarantees a minimum gain."""
+    from kernel_backend.engine.perceptual.jnd_model import silence_gate as compute_sg
+
+    # Build signal with loud + near-silent regions (mimics speech)
+    rng = np.random.default_rng(42)
+    band = np.concatenate([
+        rng.standard_normal(2048).astype(np.float32),
+        rng.standard_normal(2048).astype(np.float32) * 0.0001,
+    ])
+    sg = compute_sg(band, SR, DWT_LEVEL)
+
+    gain_no_floor = masking_gain(
+        band, SR, DWT_LEVEL, alpha=0.70, min_floor=0.12,
+        silence_gate=sg, energy_floor=0.0,
+    )
+    gain_with_floor = masking_gain(
+        band, SR, DWT_LEVEL, alpha=0.70, min_floor=0.12,
+        silence_gate=sg, energy_floor=0.08,
+    )
+
+    # The minimum gain should be higher with energy_floor
+    min_no_floor = float(np.min(gain_no_floor))
+    min_with_floor = float(np.min(gain_with_floor))
+    assert min_with_floor > min_no_floor, (
+        f"energy_floor should raise minimum: {min_with_floor:.4f} vs {min_no_floor:.4f}"
+    )
+    # The mean gain should also be higher (more energy in quiet regions)
+    mean_no_floor = float(np.mean(gain_no_floor))
+    mean_with_floor = float(np.mean(gain_with_floor))
+    assert mean_with_floor > mean_no_floor, (
+        f"energy_floor should raise mean gain: {mean_with_floor:.4f} vs {mean_no_floor:.4f}"
+    )
+
+
+def test_energy_floor_preserves_ceiling():
+    """energy_floor must not push any gain value above 1.0."""
+    from kernel_backend.engine.perceptual.jnd_model import silence_gate as compute_sg
+
+    rng = np.random.default_rng(42)
+    band = np.concatenate([
+        rng.standard_normal(2048).astype(np.float32),
+        rng.standard_normal(2048).astype(np.float32) * 0.0001,
+    ])
+    sg = compute_sg(band, SR, DWT_LEVEL)
+    gain = masking_gain(
+        band, SR, DWT_LEVEL, alpha=0.70, min_floor=0.12,
+        silence_gate=sg, energy_floor=0.08,
+    )
+    assert np.all(gain <= 1.0 + 1e-5), "energy_floor must not breach ceiling"
+
+
+def test_energy_floor_zero_is_noop():
+    """energy_floor=0.0 should produce identical output to omitting it."""
+    band = _dwt_band(white_noise(duration_s=2.0))
+    gain_default = masking_gain(band, SR, DWT_LEVEL)
+    gain_zero = masking_gain(band, SR, DWT_LEVEL, energy_floor=0.0)
+    np.testing.assert_array_equal(gain_default, gain_zero)

@@ -2,41 +2,18 @@ from __future__ import annotations
 
 import pytest
 
-from kernel_backend.core.domain.watermark import (
-    AudioEmbeddingParams,
-    EmbeddingParams,
-    VideoEmbeddingParams,
-    SegmentFingerprint,
-    VideoEntry,
-)
-
-_TEST_EMBEDDING_PARAMS = EmbeddingParams(
-    audio=AudioEmbeddingParams(
-        dwt_levels=(1, 2),
-        chips_per_bit=256,
-        psychoacoustic=False,
-        safety_margin_db=3.0,
-        target_snr_db=-14.0,
-    ),
-    video=VideoEmbeddingParams(
-        jnd_adaptive=False,
-        qim_step_base=64.0,
-        qim_step_min=44.0,
-        qim_step_max=128.0,
-        qim_quantize_to=4.0,
-    ),
-)
+from kernel_backend.core.domain.watermark import SegmentFingerprint, VideoEntry
 from kernel_backend.infrastructure.database.repositories import VideoRepository
+from tests.helpers.signing_defaults import DEFAULT_EMBEDDING_PARAMS
 
 ENTRY = VideoEntry(
     content_id="test-content-001",
     author_id="author-test-id",
     author_public_key="-----BEGIN PUBLIC KEY-----\ntest-key\n-----END PUBLIC KEY-----\n",
-    active_signals=["pilot_audio", "wid_audio", "fingerprint_audio"],
+    active_signals=["wid_audio", "fingerprint_audio"],
     rs_n=32,
-    pilot_hash_48=0xABCDEF012345,
     manifest_signature=b"\x00" * 64,
-    embedding_params=_TEST_EMBEDDING_PARAMS,
+    embedding_params=DEFAULT_EMBEDDING_PARAMS,
     schema_version=2,
     status="VALID",
 )
@@ -50,7 +27,6 @@ async def test_save_and_retrieve_video(db_session) -> None:
     assert retrieved.content_id == ENTRY.content_id
     assert retrieved.author_id == ENTRY.author_id
     assert retrieved.rs_n == ENTRY.rs_n
-    assert retrieved.pilot_hash_48 == ENTRY.pilot_hash_48
     assert retrieved.manifest_signature == ENTRY.manifest_signature
     assert retrieved.active_signals == ENTRY.active_signals
     assert retrieved.status == ENTRY.status
