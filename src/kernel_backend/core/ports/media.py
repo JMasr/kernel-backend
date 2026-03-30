@@ -84,6 +84,7 @@ class MediaPort(ABC):
         frames: list[np.ndarray],
         fps: float,
         output_path: Path,
+        crf: int = 28,
     ) -> None:
         """Write BGR frames to a video file (mp4/H.264)."""
 
@@ -111,10 +112,14 @@ class MediaPort(ABC):
         height: int,
         fps: float,
         output_path: Path,
+        crf: int = 28,
     ) -> Any:
         """
         Opens an FFmpeg subprocess to receive raw YUV frames via stdin and
-        encode them as H.264 lossless (crf=0) into output_path.
+        encode them as H.264 into output_path.
+
+        crf controls quality: 0 = lossless, 18 = visually lossless (default),
+        23 = H.264 default, 28 = noticeable compression.
 
         Returns the Popen object. Caller writes yuv.tobytes() per frame,
         then calls stdin.close() and wait().

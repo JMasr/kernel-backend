@@ -175,11 +175,15 @@ class MediaService(MediaPort):
         height: int,
         fps: float,
         output_path: Path,
+        crf: int = 28,
     ):
         """
-        Opens an FFmpeg subprocess for streaming H.264 lossless video encode.
+        Opens an FFmpeg subprocess for streaming H.264 video encode.
         Caller writes yuv.tobytes() per frame (yuvj420p full-range),
         then calls stdin.close() and wait().
+
+        crf=28 is the default — confirmed to preserve QIM watermarks in calibration — confirmed to preserve
+        QIM watermarks (0/24 errors at CRF 18/23/28 in calibration).
         """
         import subprocess
 
@@ -189,7 +193,7 @@ class MediaService(MediaPort):
             "-s", f"{width}x{height}",
             "-r", str(fps),
             "-i", "pipe:0",
-            "-vcodec", "libx264", "-crf", "0", "-preset", "ultrafast",
+            "-vcodec", "libx264", "-crf", str(crf), "-preset", "ultrafast",
             "-pix_fmt", "yuvj420p",
             "-loglevel", "quiet",
             str(output_path),
@@ -252,12 +256,15 @@ class MediaService(MediaPort):
         frames: list[np.ndarray],
         fps: float,
         output_path: Path,
+        crf: int = 28,
     ) -> None:
         """Write BGR frames to H.264 mp4 via a single ffmpeg pipe pass.
 
         Streams raw BGR frames directly to the H.264 encoder — no intermediate
         lossy codec (mp4v). A single-pass encode preserves QIM watermarks far
         better than the double-lossy mp4v → H.264 pipeline (Fix 7).
+
+        crf=28 is the default — confirmed to preserve QIM watermarks in calibration.
         """
         import subprocess
 
@@ -271,7 +278,7 @@ class MediaService(MediaPort):
             "-f", "rawvideo", "-pix_fmt", "yuvj420p",
             "-s", f"{w}x{h}", "-r", str(fps),
             "-i", "pipe:0",
-            "-vcodec", "libx264", "-crf", "0", "-preset", "ultrafast",
+            "-vcodec", "libx264", "-crf", str(crf), "-preset", "ultrafast",
             "-pix_fmt", "yuvj420p",
             "-loglevel", "quiet",
             str(output_path),

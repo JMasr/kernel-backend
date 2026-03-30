@@ -19,6 +19,7 @@ from kernel_backend.core.domain.watermark import (
     AudioEmbeddingParams,
     EmbeddingParams,
     VideoEmbeddingParams,
+    embedding_params_from_dict,
     embedding_params_to_dict,
     SegmentFingerprint,
     VideoEntry,
@@ -58,6 +59,14 @@ _DEFAULT_VIDEO_PARAMS = VideoEmbeddingParams(
     qim_step_min=_M.video_wid.qim_step_min,
     qim_step_max=_M.video_wid.qim_step_max,
     qim_quantize_to=_M.video_wid.qim_quantize_to,
+)
+
+_DEFAULT_AV_AUDIO_PARAMS = AudioEmbeddingParams(
+    dwt_levels=_M.audio_wid.dwt_levels,
+    chips_per_bit=_M.audio_wid.chips_per_bit,
+    psychoacoustic=_M.audio_wid.psychoacoustic,
+    safety_margin_db=_M.audio_wid.safety_margin_db,
+    target_snr_db=_M.audio_wid.target_snr_db_av,
 )
 
 _DEFAULT_EMBEDDING_PARAMS = EmbeddingParams(
@@ -137,10 +146,7 @@ async def _persist_payload(
 
     raw_ep = payload.get("embedding_params")
     embedding_params = (
-        EmbeddingParams(
-            audio=AudioEmbeddingParams(**dict(raw_ep["audio"], dwt_levels=tuple(raw_ep["audio"]["dwt_levels"]))),
-            video=VideoEmbeddingParams(**raw_ep["video"]) if raw_ep.get("video") else None,
-        )
+        embedding_params_from_dict(raw_ep)
         if raw_ep is not None
         else _DEFAULT_EMBEDDING_PARAMS
     )
@@ -187,8 +193,10 @@ def _sign_audio_cpu(
     media: MediaPort,
     org_id: UUID | None = None,
     original_filename: str = "",
+    audio_params: AudioEmbeddingParams | None = None,
 ) -> RawSigningPayload:
     """CPU phase of audio signing. Returns a serialisable RawSigningPayload."""
+    ap = audio_params or _DEFAULT_AUDIO_PARAMS
     # 1. Probe
     profile = media.probe(media_path)
     if profile.container_type == "video_only":
@@ -251,7 +259,7 @@ def _sign_audio_cpu(
     # 10–11. Hopping plan + RS symbols
     band_configs = plan_audio_hopping(
         rs_n, content_id, certificate.public_key_pem, pepper,
-        force_levels=list(_DEFAULT_AUDIO_PARAMS.dwt_levels),
+        force_levels=list(ap.dwt_levels),
     )
     rs_symbols = ReedSolomonCodec(rs_n).encode(wid.data)
 
@@ -283,9 +291,9 @@ def _sign_audio_cpu(
                 )
                 chunk = embed_audio_segment(
                     chunk, rs_symbols[seg_idx], band_configs[seg_idx], pn_seed,
-                    chips_per_bit=_DEFAULT_AUDIO_PARAMS.chips_per_bit,
-                    target_snr_db=_DEFAULT_AUDIO_PARAMS.target_snr_db,  # -26 dB; Z-score tiling gain
-                    use_psychoacoustic=False,  # bark model non-functional (STFT/DWT unit mismatch)
+                    chips_per_bit=ap.chips_per_bit,
+                    target_snr_db=ap.target_snr_db,
+                    use_psychoacoustic=ap.psychoacoustic,
                 )
             if encoder_proc.stdin:
                 encoder_proc.stdin.write(
@@ -322,7 +330,7 @@ def _sign_audio_cpu(
         video_fingerprints=None,
         media_type="audio",
         embedding_params=embedding_params_to_dict(
-            EmbeddingParams(audio=_DEFAULT_AUDIO_PARAMS, video=None)
+            EmbeddingParams(audio=ap, video=None)
         ),
     )
 
@@ -335,8 +343,11 @@ def _sign_video_cpu(
     media: MediaPort,
     org_id: UUID | None = None,
     original_filename: str = "",
+    video_params: VideoEmbeddingParams | None = None,
+    output_crf: int | None = None,
 ) -> RawSigningPayload:
     """CPU phase of video signing. Returns a serialisable RawSigningPayload."""
+    vp = video_params or _DEFAULT_VIDEO_PARAMS
     # 1. Probe — reject audio-only containers
     profile = media.probe(media_path)
     if not profile.has_video:
@@ -393,7 +404,8 @@ def _sign_video_cpu(
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         signed_path = Path(tmp.name)
 
-    encoder_proc = media.open_video_encode_stream(width, height, fps, signed_path)
+    crf_kwargs = {"crf": output_crf} if output_crf is not None else {}
+    encoder_proc = media.open_video_encode_stream(width, height, fps, signed_path, **crf_kwargs)
 
     try:
         for seg_idx, seg_frames, _ in media.iter_video_segments(
@@ -416,8 +428,8 @@ def _sign_video_cpu(
                 frame = embed_video_frame(
                     frame, symbol_bits, content_id,
                     certificate.public_key_pem, seg_idx, pepper,
-                    use_jnd_adaptive=_DEFAULT_VIDEO_PARAMS.jnd_adaptive,
-                    jnd_params=_DEFAULT_VIDEO_PARAMS,
+                    use_jnd_adaptive=vp.jnd_adaptive,
+                    jnd_params=vp,
                 )
                 encoder_proc.stdin.write(frame_to_yuv420(frame))
 
@@ -455,7 +467,9 @@ def _sign_video_cpu(
             for fp in video_fingerprints
         ],
         media_type="video",
-        embedding_params=embedding_params_to_dict(_DEFAULT_EMBEDDING_PARAMS),
+        embedding_params=embedding_params_to_dict(
+            EmbeddingParams(audio=None, video=vp)
+        ),
     )
 
 
@@ -467,8 +481,13 @@ def _sign_av_cpu(
     media: MediaPort,
     org_id: UUID | None = None,
     original_filename: str = "",
+    audio_params: AudioEmbeddingParams | None = None,
+    video_params: VideoEmbeddingParams | None = None,
+    output_crf: int | None = None,
 ) -> RawSigningPayload:
     """CPU phase of AV signing (single shared WID). Returns a serialisable RawSigningPayload."""
+    ap = audio_params or _DEFAULT_AV_AUDIO_PARAMS
+    vp = video_params or _DEFAULT_VIDEO_PARAMS
     # 1. Probe — require both tracks
     profile = media.probe(media_path)
     if not profile.has_video or not profile.has_audio:
@@ -539,7 +558,7 @@ def _sign_av_cpu(
     # 12. Audio hopping plan
     band_configs = plan_audio_hopping(
         rs_n, content_id, certificate.public_key_pem, pepper,
-        force_levels=list(_DEFAULT_AUDIO_PARAMS.dwt_levels),
+        force_levels=list(ap.dwt_levels),
     )
 
     # 13. Embed audio — streaming pass
@@ -567,11 +586,9 @@ def _sign_av_cpu(
                 )
                 chunk = embed_audio_segment(
                     chunk, rs_symbols[seg_idx], band_configs[seg_idx], pn_seed,
-                    chips_per_bit=_DEFAULT_AUDIO_PARAMS.chips_per_bit,
-                    target_snr_db=-14.0,  # AV uses 192k AAC; must survive double-AAC (192k→128k).
-                                          # -14 dB gives post-double-AAC Z≈2.2 (threshold 1.0).
-                                          # Interim value — recalibration sprint will fine-tune.
-                    use_psychoacoustic=False,  # bark model non-functional (STFT/DWT unit mismatch)
+                    chips_per_bit=ap.chips_per_bit,
+                    target_snr_db=ap.target_snr_db,
+                    use_psychoacoustic=ap.psychoacoustic,
                 )
             if encoder_proc.stdin:
                 encoder_proc.stdin.write(
@@ -590,7 +607,8 @@ def _sign_av_cpu(
     av_fps = av_profile.fps
     av_width, av_height = av_profile.width, av_profile.height
 
-    video_encoder = media.open_video_encode_stream(av_width, av_height, av_fps, video_signed_path)
+    crf_kwargs = {"crf": output_crf} if output_crf is not None else {}
+    video_encoder = media.open_video_encode_stream(av_width, av_height, av_fps, video_signed_path, **crf_kwargs)
     output_path: Path | None = None
     try:
         for seg_idx, seg_frames, _ in media.iter_video_segments(
@@ -612,8 +630,8 @@ def _sign_av_cpu(
                 frame = embed_video_frame(
                     frame, symbol_bits, content_id,
                     certificate.public_key_pem, seg_idx, pepper,
-                    use_jnd_adaptive=_DEFAULT_VIDEO_PARAMS.jnd_adaptive,
-                    jnd_params=_DEFAULT_VIDEO_PARAMS,
+                    use_jnd_adaptive=vp.jnd_adaptive,
+                    jnd_params=vp,
                 )
                 video_encoder.stdin.write(frame_to_yuv420(frame))
 
@@ -671,7 +689,9 @@ def _sign_av_cpu(
             for fp in video_fingerprints
         ],
         media_type="av",
-        embedding_params=embedding_params_to_dict(_DEFAULT_EMBEDDING_PARAMS),
+        embedding_params=embedding_params_to_dict(
+            EmbeddingParams(audio=ap, video=vp)
+        ),
     )
 
 
@@ -689,13 +709,14 @@ async def sign_audio(
     media: MediaPort,
     org_id: UUID | None = None,
     original_filename: str = "",
+    audio_params: AudioEmbeddingParams | None = None,
 ) -> SigningResult:
     """
     Full audio signing pipeline. Orchestrates DSP, cryptography, storage, and
     registry operations. Raises ValueError on unsupported container or too-short
     audio.
     """
-    payload = _sign_audio_cpu(media_path, certificate, private_key_pem, pepper, media, org_id, original_filename)
+    payload = _sign_audio_cpu(media_path, certificate, private_key_pem, pepper, media, org_id, original_filename, audio_params=audio_params)
     await _persist_payload(payload, storage, registry)
     return _payload_to_signing_result(payload)
 
@@ -710,12 +731,14 @@ async def sign_video(
     media: MediaPort,
     org_id: UUID | None = None,
     original_filename: str = "",
+    video_params: VideoEmbeddingParams | None = None,
+    output_crf: int | None = None,
 ) -> SigningResult:
     """
     Video-only signing pipeline.
     Raises ValueError on audio-only containers or too-short video.
     """
-    payload = _sign_video_cpu(media_path, certificate, private_key_pem, pepper, media, org_id, original_filename)
+    payload = _sign_video_cpu(media_path, certificate, private_key_pem, pepper, media, org_id, original_filename, video_params=video_params, output_crf=output_crf)
     await _persist_payload(payload, storage, registry)
     return _payload_to_signing_result(payload)
 
@@ -730,6 +753,9 @@ async def sign_av(
     media: MediaPort,
     org_id: UUID | None = None,
     original_filename: str = "",
+    audio_params: AudioEmbeddingParams | None = None,
+    video_params: VideoEmbeddingParams | None = None,
+    output_crf: int | None = None,
 ) -> SigningResult:
     """
     Audio+Video signing pipeline with a SINGLE shared WID.
@@ -742,6 +768,6 @@ async def sign_av(
     channel without the original Ed25519 private key — the WID is derived from
     the signature over the original manifest which committed to BOTH channels.
     """
-    payload = _sign_av_cpu(media_path, certificate, private_key_pem, pepper, media, org_id, original_filename)
+    payload = _sign_av_cpu(media_path, certificate, private_key_pem, pepper, media, org_id, original_filename, audio_params=audio_params, video_params=video_params, output_crf=output_crf)
     await _persist_payload(payload, storage, registry)
     return _payload_to_signing_result(payload)
