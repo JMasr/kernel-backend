@@ -24,26 +24,28 @@ class VideoEmbeddingParams:
 
 @dataclass(frozen=True)
 class EmbeddingParams:
-    audio: AudioEmbeddingParams
+    audio: AudioEmbeddingParams | None  # None for video-only content
     video: VideoEmbeddingParams | None  # None for audio-only content
 
 
 def embedding_params_to_dict(p: EmbeddingParams) -> dict:
     """Serialize EmbeddingParams to a flat dict suitable for JSONB storage."""
     return {
-        "audio": asdict(p.audio),
+        "audio": asdict(p.audio) if p.audio else None,
         "video": asdict(p.video) if p.video else None,
     }
 
 
 def embedding_params_from_dict(d: dict) -> EmbeddingParams:
     """Deserialize EmbeddingParams from a dict (read from JSONB)."""
-    audio_data = d["audio"]
-    # tuple[int, ...] is stored as list in JSON — convert back
-    audio_data = dict(audio_data)
-    audio_data["dwt_levels"] = tuple(audio_data["dwt_levels"])
+    audio_obj = None
+    if d.get("audio"):
+        audio_data = dict(d["audio"])
+        # tuple[int, ...] is stored as list in JSON — convert back
+        audio_data["dwt_levels"] = tuple(audio_data["dwt_levels"])
+        audio_obj = AudioEmbeddingParams(**audio_data)
     return EmbeddingParams(
-        audio=AudioEmbeddingParams(**audio_data),
+        audio=audio_obj,
         video=VideoEmbeddingParams(**d["video"]) if d.get("video") else None,
     )
 
