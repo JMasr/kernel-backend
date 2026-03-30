@@ -31,7 +31,12 @@ from kernel_backend.core.domain.verification import (
     VerificationResult,
     Verdict,
 )
-from kernel_backend.core.domain.watermark import EmbeddingParams, embedding_params_to_dict
+from kernel_backend.core.domain.watermark import (
+    AudioEmbeddingParams,
+    EmbeddingParams,
+    VideoEmbeddingParams,
+    embedding_params_to_dict,
+)
 from kernel_backend.core.services.crypto_service import derive_wid, generate_keypair
 from kernel_backend.core.services.signing_service import (
     sign_audio,
@@ -41,7 +46,7 @@ from kernel_backend.core.services.signing_service import (
 from kernel_backend.core.services.verification_service import VerificationService
 from kernel_backend.infrastructure.media.media_service import MediaService
 from tests.helpers.fakes import FakeRegistry, FakeStorage
-from tests.helpers.signing_defaults import DEFAULT_AUDIO_PARAMS, DEFAULT_EMBEDDING_PARAMS
+from tests.helpers.signing_defaults import DEFAULT_AUDIO_PARAMS, DEFAULT_EMBEDDING_PARAMS, DEFAULT_VIDEO_PARAMS
 
 PEPPER = b"pipeline-test-pepper-padded-32b!"
 
@@ -184,6 +189,7 @@ async def test_video_sign_verify_roundtrip(synthetic_video_120s: Path) -> None:
         registry=registry,
         pepper=PEPPER,
         media=media,
+        output_crf=0,  # lossless for synthetic correctness test
     )
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
@@ -227,6 +233,7 @@ async def test_av_sign_verify_roundtrip(synthetic_av_120s: Path) -> None:
         registry=registry,
         pepper=PEPPER,
         media=media,
+        output_crf=0,  # lossless for synthetic correctness test
     )
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
@@ -454,3 +461,66 @@ async def test_audio_only_file_rejected_by_sign_video(tmp_path: Path) -> None:
             pepper=PEPPER,
             media=MediaService(),
         )
+
+
+# ── Custom param propagation tests ────────────────────────────────────────
+
+
+@pytest.mark.slow
+async def test_audio_custom_params_propagate(synthetic_audio_120s: Path) -> None:
+    """sign_audio(audio_params=custom) stores the custom target_snr_db in the registry entry."""
+    custom_snr = -26.0
+    custom_params = AudioEmbeddingParams(
+        dwt_levels=DEFAULT_AUDIO_PARAMS.dwt_levels,
+        chips_per_bit=DEFAULT_AUDIO_PARAMS.chips_per_bit,
+        psychoacoustic=DEFAULT_AUDIO_PARAMS.psychoacoustic,
+        safety_margin_db=DEFAULT_AUDIO_PARAMS.safety_margin_db,
+        target_snr_db=custom_snr,
+    )
+    private_pem, public_pem = generate_keypair()
+    cert = _make_cert(public_pem)
+    registry = FakeRegistry()
+
+    result = await sign_audio(
+        media_path=synthetic_audio_120s,
+        certificate=cert,
+        private_key_pem=private_pem,
+        storage=FakeStorage(),
+        registry=registry,
+        pepper=PEPPER,
+        media=MediaService(),
+        audio_params=custom_params,
+    )
+
+    entry = registry._videos[result.content_id]
+    assert entry.embedding_params.audio.target_snr_db == custom_snr
+
+
+@pytest.mark.slow
+async def test_video_custom_params_propagate(synthetic_video_120s: Path) -> None:
+    """sign_video(video_params=custom) stores the custom qim_step_base in the registry entry."""
+    custom_step = 80.0
+    custom_params = VideoEmbeddingParams(
+        jnd_adaptive=DEFAULT_VIDEO_PARAMS.jnd_adaptive,
+        qim_step_base=custom_step,
+        qim_step_min=custom_step,
+        qim_step_max=custom_step,
+        qim_quantize_to=1.0,
+    )
+    private_pem, public_pem = generate_keypair()
+    cert = _make_cert(public_pem)
+    registry = FakeRegistry()
+
+    result = await sign_video(
+        media_path=synthetic_video_120s,
+        certificate=cert,
+        private_key_pem=private_pem,
+        storage=FakeStorage(),
+        registry=registry,
+        pepper=PEPPER,
+        media=MediaService(),
+        video_params=custom_params,
+    )
+
+    entry = registry._videos[result.content_id]
+    assert entry.embedding_params.video.qim_step_base == custom_step

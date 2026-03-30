@@ -9,11 +9,19 @@ Reproduces the full production pipeline for each polygon clip:
   4. Verify with VerificationService
   5. Report VERIFIED/RED verdict per clip per degradation condition
 
+Supports custom watermark energy levels for imperceptibility/robustness
+calibration via --audio-snr and --video-step flags.
+
 Usage:
     uv run python scripts/listening_test.py --polygon              # audio only
     uv run python scripts/listening_test.py --polygon --all        # audio + video
     uv run python scripts/listening_test.py --polygon --video-only # video only
     uv run python scripts/listening_test.py --polygon --all --out-dir /tmp/inspect
+
+    # Custom watermark energy (sweep calibration):
+    uv run python scripts/listening_test.py --polygon --audio-snr -26.0
+    uv run python scripts/listening_test.py --polygon --video-only --video-step 32.0
+    uv run python scripts/listening_test.py --polygon --all --audio-snr -22.0 --video-step 40.0
 
 Output: scripts/output/listening_test/
 """
@@ -40,11 +48,23 @@ from kernel_backend.core.domain.verification import (
     VerificationResult,
     Verdict,
 )
-from kernel_backend.core.domain.watermark import SegmentFingerprint, VideoEntry
+from kernel_backend.core.domain.watermark import (
+    AudioEmbeddingParams,
+    SegmentFingerprint,
+    VideoEmbeddingParams,
+    VideoEntry,
+)
 from kernel_backend.core.ports.registry import RegistryPort
 from kernel_backend.core.ports.storage import StorageKeyNotFoundError, StoragePort
 from kernel_backend.core.services.crypto_service import generate_keypair
-from kernel_backend.core.services.signing_service import sign_audio, sign_av, sign_video
+from kernel_backend.core.services.signing_service import (
+    _DEFAULT_AUDIO_PARAMS,
+    _DEFAULT_AV_AUDIO_PARAMS,
+    _DEFAULT_VIDEO_PARAMS,
+    sign_audio,
+    sign_av,
+    sign_video,
+)
 from kernel_backend.core.services.verification_service import VerificationService
 from kernel_backend.infrastructure.media.media_service import MediaService
 
@@ -266,6 +286,8 @@ async def process_clip(
     path: Path,
     infra: Infra,
     output_dir: Path,
+    audio_params: AudioEmbeddingParams | None = None,
+    video_params: VideoEmbeddingParams | None = None,
 ) -> ClipResult:
     # Determine clip type
     profile = infra.media.probe(path)
@@ -304,16 +326,20 @@ async def process_clip(
             result = await sign_av(
                 path, infra.certificate, infra.private_pem,
                 infra.storage, infra.registry, infra.pepper, infra.media,
+                audio_params=audio_params,
+                video_params=video_params,
             )
         elif clip_type == "video":
             result = await sign_video(
                 path, infra.certificate, infra.private_pem,
                 infra.storage, infra.registry, infra.pepper, infra.media,
+                video_params=video_params,
             )
         else:
             result = await sign_audio(
                 path, infra.certificate, infra.private_pem,
                 infra.storage, infra.registry, infra.pepper, infra.media,
+                audio_params=audio_params,
             )
     except Exception as exc:
         sign_error = str(exc)
@@ -449,13 +475,32 @@ def _b(flag: bool) -> str:
     return "✓" if flag else "✗"
 
 
-def make_report(results: list[ClipResult], output_dir: Path) -> str:
+def make_report(
+    results: list[ClipResult],
+    output_dir: Path,
+    audio_params: AudioEmbeddingParams | None = None,
+    video_params: VideoEmbeddingParams | None = None,
+) -> str:
     lines: list[str] = []
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     lines += [
         "# End-to-End Signing + Verification Report",
         f"Date: {now}",
+        "",
+    ]
+
+    # Show watermark energy configuration
+    a_snr = audio_params.target_snr_db if audio_params else _DEFAULT_AUDIO_PARAMS.target_snr_db
+    v_step = video_params.qim_step_base if video_params else _DEFAULT_VIDEO_PARAMS.qim_step_base
+    a_label = "CUSTOM" if audio_params else "production"
+    v_label = "CUSTOM" if video_params else "production"
+    lines += [
+        "## Watermark Parameters",
+        f"  Audio target_snr_db: {a_snr} ({a_label},"
+        f" production = {_DEFAULT_AUDIO_PARAMS.target_snr_db})",
+        f"  Video qim_step_base: {v_step} ({v_label},"
+        f" production = {_DEFAULT_VIDEO_PARAMS.qim_step_base})",
         "",
     ]
 
@@ -656,6 +701,37 @@ async def _async_main(args: argparse.Namespace) -> None:
     infra = bootstrap_infra()
     print(f"Keypair : {infra.certificate.public_key_pem.splitlines()[1][:40]}...")
     print(f"Pepper  : {infra.pepper.hex()[:16]}...")
+
+    # ── Build custom params from CLI flags ────────────────────────────────────
+    audio_params: AudioEmbeddingParams | None = None
+    video_params: VideoEmbeddingParams | None = None
+
+    if args.audio_snr is not None:
+        audio_params = AudioEmbeddingParams(
+            dwt_levels=_DEFAULT_AUDIO_PARAMS.dwt_levels,
+            chips_per_bit=_DEFAULT_AUDIO_PARAMS.chips_per_bit,
+            psychoacoustic=_DEFAULT_AUDIO_PARAMS.psychoacoustic,
+            safety_margin_db=_DEFAULT_AUDIO_PARAMS.safety_margin_db,
+            target_snr_db=args.audio_snr,
+        )
+        print(f"Audio   : custom target_snr_db = {args.audio_snr} dB"
+              f"  (production = {_DEFAULT_AUDIO_PARAMS.target_snr_db})")
+    else:
+        print(f"Audio   : production defaults (target_snr_db = {_DEFAULT_AUDIO_PARAMS.target_snr_db})")
+
+    if args.video_step is not None:
+        video_params = VideoEmbeddingParams(
+            jnd_adaptive=True,
+            qim_step_base=args.video_step,
+            qim_step_min=args.video_step,
+            qim_step_max=args.video_step,
+            qim_quantize_to=1.0,
+        )
+        print(f"Video   : custom qim_step = {args.video_step}"
+              f"  (production = {_DEFAULT_VIDEO_PARAMS.qim_step_base})")
+    else:
+        print(f"Video   : production defaults (qim_step_base = {_DEFAULT_VIDEO_PARAMS.qim_step_base})")
+
     print()
 
     clips: list[tuple[str, Path]] = []
@@ -682,11 +758,12 @@ async def _async_main(args: argparse.Namespace) -> None:
     for name, path in clips:
         print(f"\n{'─' * 60}")
         print(f"Processing: {name}  ({path.name})")
-        r = await process_clip(name, path, infra, output_dir)
+        r = await process_clip(name, path, infra, output_dir,
+                               audio_params=audio_params, video_params=video_params)
         results.append(r)
 
     print(f"\n{'═' * 60}")
-    report = make_report(results, output_dir)
+    report = make_report(results, output_dir, audio_params, video_params)
     print(report)
 
     report_path = output_dir / "report.md"
@@ -709,6 +786,14 @@ def main() -> None:
     parser.add_argument(
         "--video-only", action="store_true",
         help="Process video clips only",
+    )
+    parser.add_argument(
+        "--audio-snr", type=float, default=None,
+        help="Override audio target_snr_db (e.g. -22.0). Default: production value.",
+    )
+    parser.add_argument(
+        "--video-step", type=float, default=None,
+        help="Override video qim_step_base (e.g. 40.0). Default: production value.",
     )
     parser.add_argument(
         "--out-dir", default="scripts/output/listening_test/",
