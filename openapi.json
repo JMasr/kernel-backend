@@ -129,6 +129,19 @@
             }
           }
         }
+      },
+      "delete": {
+        "tags": [
+          "identity"
+        ],
+        "summary": "Delete My Identity",
+        "description": "Delete the authenticated user's identity to allow regeneration.\n\nPreviously signed content remains valid \u2014 the public key and WID\nare embedded in the content. Only the identity record is removed.",
+        "operationId": "delete_my_identity_identity_me_delete",
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          }
+        }
       }
     },
     "/identity/generate": {
@@ -306,7 +319,7 @@
           "public"
         ],
         "summary": "Verify Public",
-        "description": "Verify a media file globally across ALL organisations.\n\nDoes not require authentication. Searches fingerprints across every org.\nReturns org_name if a signed match is found.",
+        "description": "Verify a media file globally across ALL organisations.\n\nDoes not require authentication. Searches fingerprints across every org\nby trying each org's pepper until a candidate is found.\nReturns org_name if a signed match is found.",
         "operationId": "verify_public_verify_public_post",
         "requestBody": {
           "content": {
@@ -843,7 +856,7 @@
           "content"
         ],
         "summary": "Delete Content",
-        "description": "Delete signed content (org-scoped).\n\nReturns 404 if content does not exist or belongs to a different org.\nStorage object is NOT deleted \u2014 storage cleanup is a separate concern.",
+        "description": "Delete signed content (org-scoped, author-scoped for non-admins).\n\nAdmins can delete any content in their org.\nRegular members can only delete their own content.\nReturns 404 if content does not exist or belongs to a different org.\nStorage object is NOT deleted \u2014 storage cleanup is a separate concern.",
         "operationId": "delete_content_content__content_id__delete",
         "parameters": [
           {
@@ -1721,6 +1734,17 @@
             ],
             "title": "Author Id"
           },
+          "author_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Author Name"
+          },
           "org_name": {
             "anyOf": [
               {
@@ -1853,6 +1877,17 @@
                 "type": "null"
               }
             ]
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
           }
         },
         "type": "object",
@@ -2015,6 +2050,28 @@
             "type": "number",
             "title": "Fingerprint Confidence",
             "default": 0.0
+          },
+          "author_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Author Name"
+          },
+          "org_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Org Name"
           },
           "audio_verdict": {
             "anyOf": [
