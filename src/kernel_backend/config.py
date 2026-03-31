@@ -16,9 +16,16 @@ class Settings(BaseSettings):
     REDIS_PORT: int = 6379
     REDIS_PASSWORD: str
     REDIS_SSL: bool = True
-    STORAGE_BACKEND: Literal["local", "r2"] = "local"
+    STORAGE_BACKEND: Literal["local", "s3"] = "local"
     STORAGE_LOCAL_BASE_PATH: Path = Path("./data/media")
     STORAGE_HMAC_SECRET: str = _HMAC_SECRET_PLACEHOLDER
+
+    # S3-compatible storage (MinIO dev / Cloudflare R2 prod)
+    S3_ENDPOINT_URL: str = ""
+    S3_ACCESS_KEY_ID: str = ""
+    S3_SECRET_ACCESS_KEY: str = ""
+    S3_BUCKET_NAME: str = ""
+    S3_REGION: str = "auto"
     ENV: Literal["development", "production"] = "development"
     LOG_LEVEL: str = "INFO"
     SENTRY_DSN: str = ""
