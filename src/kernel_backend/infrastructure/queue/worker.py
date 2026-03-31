@@ -8,7 +8,7 @@ from kernel_backend.infrastructure.database.repositories import SessionFactoryRe
 from kernel_backend.infrastructure.database.session import make_engine, make_session_factory
 from kernel_backend.infrastructure.queue.jobs import process_sign_job
 from kernel_backend.infrastructure.queue.redis_pool import make_redis_settings
-from kernel_backend.infrastructure.storage.local_storage import LocalStorageAdapter
+from kernel_backend.infrastructure.storage import make_storage
 
 
 async def on_startup(ctx: dict) -> None:
@@ -18,10 +18,7 @@ async def on_startup(ctx: dict) -> None:
     engine = make_engine(settings.DATABASE_URL)
     session_factory = make_session_factory(engine)
 
-    ctx["storage"] = LocalStorageAdapter(
-        base_path=settings.STORAGE_LOCAL_BASE_PATH,
-        secret_key=settings.STORAGE_HMAC_SECRET,
-    )
+    ctx["storage"] = make_storage(settings)
     ctx["registry"] = SessionFactoryRegistry(session_factory)
     ctx["pepper"] = settings.system_pepper_bytes
     ctx["process_pool"] = concurrent.futures.ProcessPoolExecutor(max_workers=2)
