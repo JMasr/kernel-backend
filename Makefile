@@ -110,6 +110,33 @@ reset-db:
 gen-fixtures:
 	$(PYTHON_INTERPRETER) scripts/gen_fixtures.py
 
+# ── Docker services ───────────────────────────────────────────────────────────
+
+## Validate credential strength in .env before starting services
+.PHONY: validate-env
+validate-env:
+	@bash scripts/validate_env.sh
+
+## Start services — production-safe, no host ports exposed (runs validate-env first)
+.PHONY: services-up
+services-up: validate-env
+	docker compose up -d
+
+## Start services with host ports bound to 127.0.0.1 — local dev only
+.PHONY: services-up-dev
+services-up-dev: validate-env
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+
+## Stop all services
+.PHONY: services-down
+services-down:
+	docker compose down
+
+## Tail service logs
+.PHONY: services-logs
+services-logs:
+	docker compose logs -f
+
 # ── Cleanup ──────────────────────────────────────────────────────────────────
 .PHONY: clean
 clean:

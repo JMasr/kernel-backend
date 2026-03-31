@@ -1,0 +1,15 @@
+# Local development override — adds host port bindings for external tooling.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+# Or:    make services-up-dev
+#
+# Ports are bound to 127.0.0.1 (localhost only) — not exposed on LAN interfaces.
+# Never use this file on a VPS or shared machine.
+services:
+  valkey:
+    ports:
+      - "127.0.0.1:6379:6379"   # redis-cli / RedisInsight access from host
+
+  minio:
+    ports:
+      - "127.0.0.1:9000:9000"   # S3 API — mc, awscli, boto3 from host
+      - "127.0.0.1:9001:9001"   # MinIO web console — http://localhost:9001
