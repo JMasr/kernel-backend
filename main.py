@@ -39,7 +39,7 @@ from kernel_backend.config import Settings, get_settings
 from kernel_backend.infrastructure.database.repositories import SessionFactoryRegistry
 from kernel_backend.infrastructure.database.session import make_engine, make_session_factory
 from kernel_backend.infrastructure.queue.redis_pool import make_redis_settings
-from kernel_backend.infrastructure.storage.local_storage import LocalStorageAdapter
+from kernel_backend.infrastructure.storage import make_storage
 
 
 @asynccontextmanager
@@ -47,10 +47,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
 
     # Storage
-    app.state.storage = LocalStorageAdapter(
-        base_path=settings.STORAGE_LOCAL_BASE_PATH,
-        secret_key=settings.STORAGE_HMAC_SECRET,
-    )
+    app.state.storage = make_storage(settings)
 
     # DB engine
     engine = make_engine(settings.DATABASE_URL)
