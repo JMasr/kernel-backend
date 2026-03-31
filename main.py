@@ -24,6 +24,7 @@ logging.getLogger("arq").setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 from kernel_backend.api.auth.router import router as auth_router
+from kernel_backend.api.health.router import router as health_router
 from kernel_backend.api.content.router import router as content_router
 from kernel_backend.api.users.router import router as users_router
 from kernel_backend.api.downloads.router import router as downloads_router
@@ -95,10 +96,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    @app.get("/")
-    async def health() -> dict:
-        return {"status": "ok", "version": "2.0.0"}
-
+    app.include_router(health_router, tags=["health"])
     app.include_router(auth_router)
     app.include_router(identity_router, prefix="/identity")
     app.include_router(signing_router)
