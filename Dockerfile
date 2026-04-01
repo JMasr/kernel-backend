@@ -33,6 +33,10 @@ WORKDIR /app
 RUN addgroup --system --gid 1001 appgroup \
  && adduser  --system --uid 1001 --ingroup appgroup appuser
 
+# Shared temp directory for signing jobs (api writes, worker reads via named volume).
+# Creating it here causes Docker to initialize the mounted volume with these permissions.
+RUN mkdir /signing && chown appuser:appgroup /signing
+
 # Copy virtual environment and source from builder
 COPY --from=builder --chown=appuser:appgroup /app/.venv ./.venv
 COPY --from=builder --chown=appuser:appgroup /app/src   ./src

@@ -493,6 +493,7 @@ dependencies = [
     { name = "cryptography" },
     { name = "fastapi" },
     { name = "ffmpeg-python" },
+    { name = "httpx" },
     { name = "jinja2" },
     { name = "librosa" },
     { name = "numpy" },
@@ -516,7 +517,6 @@ dependencies = [
 [package.optional-dependencies]
 dev = [
     { name = "aiofiles" },
-    { name = "httpx" },
     { name = "hypothesis" },
     { name = "mypy" },
     { name = "pytest" },
@@ -539,7 +539,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=42" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "ffmpeg-python", specifier = ">=0.2" },
-    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.100" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "librosa", specifier = ">=0.11.0" },
