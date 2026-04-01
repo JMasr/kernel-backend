@@ -31,8 +31,8 @@ _PUBLIC_PATHS = {
     ("POST", "/auth/refresh"),
 }
 
-# Path *prefixes* that are always public (presigned downloads, invitation accept)
-_PUBLIC_PREFIXES = ("/download/", "/invitations/accept/", "/verify/public")
+# Path *prefixes* that are always public (presigned downloads, invitation accept, health probes)
+_PUBLIC_PREFIXES = ("/download/", "/invitations/accept/", "/verify/public", "/health")
 
 # ---------------------------------------------------------------------------
 # In-memory TTL cache for Stack Auth verified tokens
