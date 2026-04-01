@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import concurrent.futures
 
+from arq import cron
+
 from kernel_backend.config import Settings
 from kernel_backend.infrastructure.database.repositories import SessionFactoryRegistry
 from kernel_backend.infrastructure.database.session import make_engine, make_session_factory
+from kernel_backend.infrastructure.queue.cleanup_job import cleanup_signing_tmp
 from kernel_backend.infrastructure.queue.health_job import health_check_job
 from kernel_backend.infrastructure.queue.jobs import process_sign_job
 from kernel_backend.infrastructure.queue.redis_pool import make_redis_settings
@@ -53,6 +56,14 @@ class WorkerSettings:
 
     # How long to keep job results in Redis.
     keep_result = 3600  # 1 hour
+
+    # Cleanup orphaned temp files in /signing every 30 minutes.
+    # run_at_startup=True handles orphans left by a previous SIGKILL before the
+    # first scheduled run (otherwise cleanup would be delayed up to 30 minutes
+    # after a crash-restart).
+    cron_jobs = [
+        cron(cleanup_signing_tmp, minute={0, 30}, run_at_startup=True),
+    ]
 
     on_startup = on_startup
     on_shutdown = on_shutdown
