@@ -34,15 +34,18 @@ async def readiness(request: Request) -> JSONResponse:
     db_session_factory = request.app.state.db_session_factory
     redis_pool = getattr(request.app.state, "redis_pool", None)
 
+    # Disk check omitted intentionally for MVP:
+    # backend containers are stateless (no mounted volumes),
+    # so shutil.disk_usage reads the container overlay FS, not the real host disk.
+    # Reinstate when a /tmp volume is mounted in docker-compose.yml.
     checks = await asyncio.gather(
         _check_database(db_session_factory),
         _check_valkey(redis_pool),
-        _check_disk(),
         _check_worker(redis_pool),
         return_exceptions=True,
     )
 
-    labels = ["database", "valkey", "disk", "worker"]
+    labels = ["database", "valkey", "worker"]
     results: dict[str, dict] = {}
     for label, result in zip(labels, checks):
         if isinstance(result, Exception):
