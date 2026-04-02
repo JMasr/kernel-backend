@@ -23,6 +23,7 @@ class S3StorageAdapter(StoragePort):
         secret_access_key: str,
         bucket_name: str,
         region: str = "auto",
+        public_endpoint_url: str = "",
     ) -> None:
         self._bucket = bucket_name
         self._client = boto3.client(
@@ -31,6 +32,21 @@ class S3StorageAdapter(StoragePort):
             aws_access_key_id=access_key_id,
             aws_secret_access_key=secret_access_key,
             region_name=region,
+        )
+        # Separate client for presigned URL generation so that download/upload
+        # links embed the public host (e.g. https://api.kernelsecurity.tech)
+        # rather than the internal Docker hostname (http://minio:9000).
+        _public = public_endpoint_url or endpoint_url
+        self._presign_client = (
+            boto3.client(
+                "s3",
+                endpoint_url=_public,
+                aws_access_key_id=access_key_id,
+                aws_secret_access_key=secret_access_key,
+                region_name=region,
+            )
+            if _public != endpoint_url
+            else self._client
         )
 
     async def put(self, key: str, data: bytes, content_type: str) -> None:
@@ -65,7 +81,7 @@ class S3StorageAdapter(StoragePort):
     async def presigned_upload_url(self, key: str, expires_in: int) -> str:
         return await asyncio.to_thread(
             partial(
-                self._client.generate_presigned_url,
+                self._presign_client.generate_presigned_url,
                 "put_object",
                 Params={"Bucket": self._bucket, "Key": key},
                 ExpiresIn=expires_in,
@@ -75,7 +91,7 @@ class S3StorageAdapter(StoragePort):
     async def presigned_download_url(self, key: str, expires_in: int) -> str:
         return await asyncio.to_thread(
             partial(
-                self._client.generate_presigned_url,
+                self._presign_client.generate_presigned_url,
                 "get_object",
                 Params={"Bucket": self._bucket, "Key": key},
                 ExpiresIn=expires_in,

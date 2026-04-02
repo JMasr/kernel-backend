@@ -22,6 +22,7 @@ class Settings(BaseSettings):
 
     # S3-compatible storage (MinIO dev / Cloudflare R2 prod)
     S3_ENDPOINT_URL: str = ""
+    S3_PUBLIC_ENDPOINT_URL: str = ""   # Public URL used for presigned URLs; falls back to S3_ENDPOINT_URL
     S3_ACCESS_KEY_ID: str = ""
     S3_SECRET_ACCESS_KEY: str = ""
     S3_BUCKET_NAME: str = ""

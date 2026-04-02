@@ -15,6 +15,7 @@ def make_storage(settings: object) -> StoragePort:
             secret_access_key=settings.S3_SECRET_ACCESS_KEY,
             bucket_name=settings.S3_BUCKET_NAME,
             region=settings.S3_REGION,
+            public_endpoint_url=settings.S3_PUBLIC_ENDPOINT_URL,
         )
 
     from kernel_backend.infrastructure.storage.local_storage import LocalStorageAdapter
