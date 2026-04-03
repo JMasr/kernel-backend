@@ -18,7 +18,7 @@ class AudioWIDConfig:
     """Audio WID beacon (DSSS + DWT) calibrated constants."""
     chips_per_bit: int = 32
     target_snr_db_audio_only: float = -20.0   # 256k AAC survival
-    target_snr_db_av: float = -14.0           # double-AAC 192k survival
+    target_snr_db_av: float = -18.0           # double-AAC 256k+ survival
     dwt_levels: tuple[int, ...] = (2,)        # single-band cD2 (5.5-11 kHz)
     erasure_threshold_z: float = 1.0
     masking_alpha: float = 0.70

@@ -61,3 +61,6 @@ class RawSigningPayload(TypedDict):
 
     # DSP parameters used at sign time (serialized dict — see EmbeddingParams)
     embedding_params: NotRequired[dict | None]
+
+    # Codec/quality parameters used at sign time (for observability — not used by verifier)
+    output_encoding_params: NotRequired[dict | None]

@@ -70,6 +70,9 @@ class VideoEntry:
     status: str = "VALID"       # "VALID" | "REVOKED"
     org_id: UUID | None = None  # organization owning this entry (Phase 6.A)
     signed_media_key: str = ""  # storage key for the signed media file (Phase 6.B-2)
+    output_encoding_params: dict | None = None
+    # Example: {'audio': {'codec': 'aac', 'bitrate': '256k', 'sample_rate': 44100},
+    #           'video': {'codec': 'libx264', 'crf': 18, 'preset': 'ultrafast'}}
 
 
 @dataclass(frozen=True)
