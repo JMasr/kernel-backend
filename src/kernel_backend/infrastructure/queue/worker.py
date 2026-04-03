@@ -12,6 +12,7 @@ from kernel_backend.infrastructure.queue.cleanup_job import cleanup_signing_tmp
 from kernel_backend.infrastructure.queue.health_job import health_check_job
 from kernel_backend.infrastructure.queue.jobs import process_sign_job
 from kernel_backend.infrastructure.queue.redis_pool import make_redis_settings
+from kernel_backend.infrastructure.email.resend_adapter import ResendEmailAdapter
 from kernel_backend.infrastructure.storage import make_storage
 
 
@@ -27,6 +28,14 @@ async def on_startup(ctx: dict) -> None:
     ctx["pepper"] = settings.system_pepper_bytes
     ctx["process_pool"] = concurrent.futures.ProcessPoolExecutor(max_workers=2)
     ctx["_engine"] = engine
+    if settings.RESEND_API_KEY:
+        ctx["email_adapter"] = ResendEmailAdapter(
+            api_key=settings.RESEND_API_KEY,
+            from_email=settings.RESEND_FROM_EMAIL,
+            frontend_base_url=settings.FRONTEND_BASE_URL,
+        )
+    else:
+        ctx["email_adapter"] = None
 
 
 async def on_shutdown(ctx: dict) -> None:
