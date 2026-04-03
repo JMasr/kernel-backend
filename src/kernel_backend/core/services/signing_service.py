@@ -45,6 +45,57 @@ from kernel_backend.engine.video.wid_watermark import (
 )
 
 
+# ── Output encoding quality helpers ──────────────────────────────────────────
+
+_LOSSLESS_MARKER_BPS: int = 1_411_200   # ≥ this → source is lossless
+_AUDIO_FLOOR_BPS: int = 256_000
+_AUDIO_CEILING_BPS: int = 384_000
+
+
+def _compute_output_audio_bitrate(
+    source_bps: int,
+    cap_lossless: bool = False,
+) -> str | None:
+    """
+    Adaptive AAC bitrate for signed audio output.
+
+    Returns None when source is lossless AND cap_lossless=False — caller uses
+    pcm_s16le / WAV instead of AAC (audio-only path).
+
+    Returns '384k' when source is lossless AND cap_lossless=True — AV path
+    avoids PCM-in-MP4 for universal container compatibility.
+
+    Floor: 256k. Ceiling: 384k.
+    """
+    if source_bps >= _LOSSLESS_MARKER_BPS:
+        return "384k" if cap_lossless else None
+    target = max(source_bps, _AUDIO_FLOOR_BPS)
+    target = min(target, _AUDIO_CEILING_BPS)
+    if target >= 350_000:
+        return "384k"
+    if target >= 280_000:
+        return "320k"
+    return "256k"
+
+
+def _compute_output_video_crf(duration_s: float) -> int:
+    """
+    Duration-adaptive CRF to bound output file size.
+
+    Policy (calibration: 0/24 watermark errors at CRF 18/20/23/28):
+      ≤ 15 min → CRF 18  (~<1 GB at 1080p, maximum quality)
+      ≤ 30 min → CRF 20  (~<2 GB at 1080p, high quality)
+      ≤ 60 min → CRF 23  (bounded size, calibrated safe)
+    """
+    if duration_s <= 900:    # 15 min
+        return 18
+    if duration_s <= 1800:   # 30 min
+        return 20
+    return 23
+
+
+# ── End output encoding helpers ───────────────────────────────────────────────
+
 _DEFAULT_AUDIO_PARAMS = AudioEmbeddingParams(
     dwt_levels=_M.audio_wid.dwt_levels,
     chips_per_bit=_M.audio_wid.chips_per_bit,
@@ -75,15 +126,23 @@ _DEFAULT_EMBEDDING_PARAMS = EmbeddingParams(
 )
 
 
-def _make_signed_name(original_filename: str, fallback_ext: str) -> str:
-    """Build a storage-safe signed filename from the original upload name."""
+def _make_signed_name(
+    original_filename: str,
+    fallback_ext: str,
+    force_ext: str | None = None,
+) -> str:
+    """Build a storage-safe signed filename from the original upload name.
+
+    force_ext overrides the source file extension — used when the output format
+    differs from the input (e.g. FLAC input → WAV output for lossless audio).
+    """
     if original_filename:
         p = Path(original_filename)
         stem = p.stem
-        ext = p.suffix or fallback_ext
+        ext = force_ext or p.suffix or fallback_ext
     else:
         stem = "output"
-        ext = fallback_ext
+        ext = force_ext or fallback_ext
     return f"{stem}_signed{ext}"
 
 
@@ -162,6 +221,7 @@ async def _persist_payload(
         manifest_json=payload["manifest_json"],
         org_id=org_id,
         signed_media_key=payload["signed_media_key"],
+        output_encoding_params=payload.get("output_encoding_params"),
     ))
 
     if payload.get("audio_fingerprints"):
@@ -264,17 +324,27 @@ def _sign_audio_cpu(
     rs_symbols = ReedSolomonCodec(rs_n).encode(wid.data)
 
     # 13–15. Pass 2 Streaming: Encode and Embed
-    # Always use .m4a for AAC output — it creates an edit list (elst) that compensates
-    # for the ~1024-sample AAC encoder priming delay.  Without it, the first decoded
-    # segment includes silence, shifting all fingerprint and WID segment boundaries.
-    with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as tmp:
+    # Determine output format before creating temp file so the suffix matches.
+    # For lossless sources (WAV/FLAC/ALAC): write watermarked PCM back as WAV —
+    # no lossy re-encoding stage; DWT-DSSS works on raw samples internally.
+    # For lossy sources: AAC with adaptive bitrate ≥ source, floor 256k, ceiling 384k.
+    #
+    # Note on .m4a vs .wav: .m4a creates an edit list (elst) that compensates for
+    # the ~1024-sample AAC encoder priming delay. For WAV output the delay is zero.
+    output_bitrate = _compute_output_audio_bitrate(profile.audio_bitrate_bps)
+    is_lossless_out = output_bitrate is None
+    out_suffix       = ".wav" if is_lossless_out else ".m4a"
+    out_codec        = "pcm_s16le" if is_lossless_out else "aac"
+    out_content_type = "audio/wav" if is_lossless_out else "audio/aac"
+
+    with tempfile.NamedTemporaryFile(suffix=out_suffix, delete=False) as tmp:
         signed_path = Path(tmp.name)
 
     encoder_proc = media.encode_audio_stream(
         sample_rate=target_sample_rate,
         output_path=signed_path,
-        codec="aac",
-        bitrate="256k",
+        codec=out_codec,
+        bitrate=output_bitrate,   # None → no -b:a flag for PCM
     )
     try:
         for seg_idx, chunk, _ in media.iter_audio_segments(
@@ -304,7 +374,7 @@ def _sign_audio_cpu(
             encoder_proc.stdin.close()
         encoder_proc.wait()
 
-    signed_name = _make_signed_name(original_filename, media_path.suffix)
+    signed_name = _make_signed_name(original_filename, media_path.suffix, force_ext=out_suffix)
     storage_key = f"signed/{content_id}/{signed_name}"
     active_signals = ["wid_audio", "fingerprint_audio"]
 
@@ -322,7 +392,7 @@ def _sign_audio_cpu(
         storage_key=storage_key,
         signed_media_key=storage_key,
         signed_file_path=str(signed_path),
-        content_type="audio/aac",
+        content_type=out_content_type,
         audio_fingerprints=[
             {"time_offset_ms": fp.time_offset_ms, "hash_hex": fp.hash_hex}
             for fp in fingerprints
@@ -332,6 +402,13 @@ def _sign_audio_cpu(
         embedding_params=embedding_params_to_dict(
             EmbeddingParams(audio=ap, video=None)
         ),
+        output_encoding_params={
+            "audio": {
+                "codec": out_codec,
+                "bitrate": output_bitrate,   # None if lossless (WAV output)
+                "sample_rate": target_sample_rate,
+            }
+        },
     )
 
 
@@ -404,8 +481,8 @@ def _sign_video_cpu(
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         signed_path = Path(tmp.name)
 
-    crf_kwargs = {"crf": output_crf} if output_crf is not None else {}
-    encoder_proc = media.open_video_encode_stream(width, height, fps, signed_path, **crf_kwargs)
+    crf_to_use = output_crf if output_crf is not None else _compute_output_video_crf(profile.duration_s)
+    encoder_proc = media.open_video_encode_stream(width, height, fps, signed_path, crf=crf_to_use)
 
     try:
         for seg_idx, seg_frames, _ in media.iter_video_segments(
@@ -470,6 +547,9 @@ def _sign_video_cpu(
         embedding_params=embedding_params_to_dict(
             EmbeddingParams(audio=None, video=vp)
         ),
+        output_encoding_params={
+            "video": {"codec": "libx264", "crf": crf_to_use, "preset": "ultrafast"},
+        },
     )
 
 
@@ -562,6 +642,12 @@ def _sign_av_cpu(
     )
 
     # 13. Embed audio — streaming pass
+    # Adaptive bitrate: ≥ source, floor 256k (raised from 192k), ceiling 384k.
+    # For lossless source audio, cap at 384k (PCM-in-MP4 has compatibility issues).
+    output_audio_bitrate = _compute_output_audio_bitrate(
+        profile.audio_bitrate_bps, cap_lossless=True
+    )
+
     with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as tmp:
         audio_signed_path = Path(tmp.name)
 
@@ -569,7 +655,7 @@ def _sign_av_cpu(
         sample_rate=target_sample_rate,
         output_path=audio_signed_path,
         codec="aac",
-        bitrate="192k",
+        bitrate=output_audio_bitrate,
     )
     try:
         for seg_idx, chunk, _ in media.iter_audio_segments(
@@ -607,8 +693,8 @@ def _sign_av_cpu(
     av_fps = av_profile.fps
     av_width, av_height = av_profile.width, av_profile.height
 
-    crf_kwargs = {"crf": output_crf} if output_crf is not None else {}
-    video_encoder = media.open_video_encode_stream(av_width, av_height, av_fps, video_signed_path, **crf_kwargs)
+    av_crf_to_use = output_crf if output_crf is not None else _compute_output_video_crf(profile.duration_s)
+    video_encoder = media.open_video_encode_stream(av_width, av_height, av_fps, video_signed_path, crf=av_crf_to_use)
     output_path: Path | None = None
     try:
         for seg_idx, seg_frames, _ in media.iter_video_segments(
@@ -692,6 +778,14 @@ def _sign_av_cpu(
         embedding_params=embedding_params_to_dict(
             EmbeddingParams(audio=ap, video=vp)
         ),
+        output_encoding_params={
+            "audio": {
+                "codec": "aac",
+                "bitrate": output_audio_bitrate,
+                "sample_rate": target_sample_rate,
+            },
+            "video": {"codec": "libx264", "crf": av_crf_to_use, "preset": "ultrafast"},
+        },
     )
 
 

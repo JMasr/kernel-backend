@@ -67,6 +67,7 @@ class Video(Base):
     status = Column(String(20), nullable=False, server_default="VALID")
     schema_version = Column(Integer, server_default=text("2"), nullable=False)
     embedding_params = Column(JSON, nullable=True)  # JSONB on Postgres, JSON on SQLite
+    output_encoding_params = Column(JSON, nullable=True)  # codec/CRF/bitrate at sign time; null for pre-sprint content
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True, index=True)
 

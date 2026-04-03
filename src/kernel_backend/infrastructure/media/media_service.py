@@ -45,6 +45,21 @@ class MediaService(MediaPort):
         if audio_stream:
             sample_rate = int(audio_stream.get("sample_rate", 44100))
 
+        _LOSSLESS_CODECS = {
+            "pcm_s16le", "pcm_s24le", "pcm_f32le", "pcm_s32le",
+            "flac", "alac", "wav",
+        }
+        audio_bitrate_bps = 0
+        if audio_stream:
+            if "bit_rate" in audio_stream:
+                audio_bitrate_bps = int(audio_stream["bit_rate"])
+            elif audio_stream.get("codec_name") in _LOSSLESS_CODECS:
+                audio_bitrate_bps = 1_411_200   # CD lossless marker (~1411 kbps)
+
+        video_bitrate_bps = 0
+        if video_stream and "bit_rate" in video_stream:
+            video_bitrate_bps = int(video_stream["bit_rate"])
+
         return MediaProfile(
             has_video=has_video,
             has_audio=has_audio,
@@ -53,6 +68,8 @@ class MediaService(MediaPort):
             fps=fps,
             duration_s=duration_s,
             sample_rate=sample_rate,
+            audio_bitrate_bps=audio_bitrate_bps,
+            video_bitrate_bps=video_bitrate_bps,
         )
 
     def decode_audio_to_pcm(
@@ -152,11 +169,13 @@ class MediaService(MediaPort):
         sample_rate: int,
         output_path: Path,
         codec: str = "aac",
-        bitrate: str = "256k",
+        bitrate: str | None = "256k",
     ):
         """
         Return a fast-running FFmpeg Popen encoding process.
         Write int16 raw PCM bytes to process.stdin.write(), then close().
+
+        bitrate=None omits the -b:a flag, required for PCM codecs (e.g. pcm_s16le / WAV).
         """
         import subprocess
 
@@ -164,9 +183,11 @@ class MediaService(MediaPort):
             "ffmpeg", "-y",
             "-f", "s16le", "-ac", "1", "-ar", str(sample_rate),
             "-i", "pipe:0",
-            "-acodec", codec, "-b:a", bitrate,
-            str(output_path)
+            "-acodec", codec,
         ]
+        if bitrate is not None:
+            cmd.extend(["-b:a", bitrate])
+        cmd.append(str(output_path))
         return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
     def open_video_encode_stream(
@@ -175,15 +196,16 @@ class MediaService(MediaPort):
         height: int,
         fps: float,
         output_path: Path,
-        crf: int = 28,
+        crf: int = 18,
     ):
         """
         Opens an FFmpeg subprocess for streaming H.264 video encode.
         Caller writes yuv.tobytes() per frame (yuvj420p full-range),
         then calls stdin.close() and wait().
 
-        crf=28 is the default — confirmed to preserve QIM watermarks in calibration — confirmed to preserve
-        QIM watermarks (0/24 errors at CRF 18/23/28 in calibration).
+        Default CRF raised 28 → 18 (better visual quality).
+        Calibration: 0/24 QIM watermark errors at CRF 0/18/23/28.
+        The signing_service passes the adaptive CRF computed from media duration.
         """
         import subprocess
 
@@ -256,7 +278,7 @@ class MediaService(MediaPort):
         frames: list[np.ndarray],
         fps: float,
         output_path: Path,
-        crf: int = 28,
+        crf: int = 18,
     ) -> None:
         """Write BGR frames to H.264 mp4 via a single ffmpeg pipe pass.
 
@@ -264,7 +286,7 @@ class MediaService(MediaPort):
         lossy codec (mp4v). A single-pass encode preserves QIM watermarks far
         better than the double-lossy mp4v → H.264 pipeline (Fix 7).
 
-        crf=28 is the default — confirmed to preserve QIM watermarks in calibration.
+        Default CRF raised 28 → 18. See open_video_encode_stream for calibration notes.
         """
         import subprocess
 

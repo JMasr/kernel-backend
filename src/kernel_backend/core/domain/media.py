@@ -13,6 +13,8 @@ class MediaProfile:
     fps: float
     duration_s: float
     sample_rate: int
+    audio_bitrate_bps: int = 0    # 0 = unknown; ≥1_411_200 = lossless marker
+    video_bitrate_bps: int = 0    # 0 = unknown (VBR common)
 
     def __post_init__(self) -> None:
         if not self.has_video and not self.has_audio:
