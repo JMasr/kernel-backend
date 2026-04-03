@@ -72,6 +72,7 @@ async def process_sign_job(
     org_id: str | None = None,
     org_pepper_hex: str | None = None,
     original_filename: str = "",
+    user_email: str | None = None,
 ) -> dict:
     """
     Deserialize certificate_json → Certificate, then run the CPU phase in a
@@ -206,6 +207,17 @@ async def process_sign_job(
                 "progress": 100,
                 "result": result,
             })
+
+        # Fire-and-forget email notification (errors must never abort the job)
+        if user_email and ctx.get("email_adapter"):
+            try:
+                await ctx["email_adapter"].send_job_complete(
+                    user_email,
+                    original_filename,
+                    result["content_id"],
+                )
+            except Exception:
+                pass  # Email failure does not affect job result
 
         return result
 

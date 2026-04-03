@@ -53,6 +53,7 @@ async def sign(
 
     # Ownership check — cert.author_id must match the authenticated user (JWT only)
     user_id: str | None = getattr(request.state, "user_id", None)
+    user_email: str | None = getattr(request.state, "email", None)
     logger.debug("sign: user_id=%s, certificate_json type=%s, len=%s, preview=%.200s",
                  user_id, type(certificate_json).__name__, len(certificate_json) if certificate_json else 0,
                  certificate_json[:200] if certificate_json else "<empty>")
@@ -128,6 +129,7 @@ async def sign(
         org_id=str(org_id) if org_id is not None else None,
         org_pepper_hex=org_pepper_hex,
         original_filename=file.filename or "",
+        user_email=user_email,
     )
 
     # Initialize job status in Redis for progress tracking
