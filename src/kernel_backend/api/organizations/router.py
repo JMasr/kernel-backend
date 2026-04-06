@@ -5,11 +5,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from kernel_backend.api.dependencies import get_session
 from kernel_backend.api.organizations.schemas import (
+    AddMemberRequest,
     ApiKeyResponse,
     CreateApiKeyRequest,
     CreateOrganizationRequest,
+    OrganizationMemberResponse,
     OrganizationResponse,
+    PaginatedMembersResponse,
     PaginatedOrganizationsResponse,
+    UpdateMemberRoleRequest,
     UpdateOrganizationRequest,
     UserOrganizationResponse,
 )
@@ -155,5 +159,92 @@ async def delete_organization(
     service = _get_service(session)
     try:
         await service.delete_organization(org_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Member management (admin only)
+# ---------------------------------------------------------------------------
+
+
+def _member_to_response(m) -> OrganizationMemberResponse:
+    return OrganizationMemberResponse(
+        id=m.id,
+        org_id=m.org_id,
+        user_id=m.user_id,
+        role=m.role,
+        created_at=m.created_at,
+    )
+
+
+@router.get("/{org_id}/members", response_model=PaginatedMembersResponse)
+async def list_members(
+    org_id: UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+) -> PaginatedMembersResponse:
+    """List members of an organization (admin only)."""
+    if not getattr(request.state, "is_admin", False):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    service = _get_service(session)
+    members, total = await service.list_members(org_id, limit=limit, offset=(page - 1) * limit)
+    return PaginatedMembersResponse(
+        items=[_member_to_response(m) for m in members],
+        total=total,
+        page=page,
+        total_pages=max(1, (total + limit - 1) // limit),
+    )
+
+
+@router.post("/{org_id}/members", status_code=201, response_model=OrganizationMemberResponse)
+async def add_member(
+    org_id: UUID,
+    body: AddMemberRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> OrganizationMemberResponse:
+    """Manually add a user to an organization (admin only)."""
+    if not getattr(request.state, "is_admin", False):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    service = _get_service(session)
+    member = await service.add_member(org_id, body.user_id, body.role)
+    return _member_to_response(member)
+
+
+@router.patch("/{org_id}/members/{user_id}", response_model=OrganizationMemberResponse)
+async def update_member_role(
+    org_id: UUID,
+    user_id: str,
+    body: UpdateMemberRoleRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> OrganizationMemberResponse:
+    """Change a member's role (admin only)."""
+    if not getattr(request.state, "is_admin", False):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    service = _get_service(session)
+    try:
+        member = await service.update_member_role(org_id, user_id, body.role)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return _member_to_response(member)
+
+
+@router.delete("/{org_id}/members/{user_id}", status_code=204)
+async def remove_member(
+    org_id: UUID,
+    user_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> None:
+    """Remove a member from an organization (admin only)."""
+    if not getattr(request.state, "is_admin", False):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    service = _get_service(session)
+    try:
+        await service.remove_member(org_id, user_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))

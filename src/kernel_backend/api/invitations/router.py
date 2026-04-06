@@ -126,6 +126,29 @@ async def create_invitation(
     return _to_response(invitation)
 
 
+@admin_router.patch("/{invitation_id}/revoke", response_model=InvitationResponse)
+async def revoke_invitation(
+    invitation_id: UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> InvitationResponse:
+    """Revoke a pending invitation (admin only). Sets status to 'expired'."""
+    _require_admin(request)
+    service = _get_service(session)
+    invitation = await service.get_by_id(invitation_id)
+    if invitation is None:
+        raise HTTPException(status_code=404, detail="Invitation not found")
+    if invitation.status != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Invitation is already {invitation.status}",
+        )
+    invitation.status = "expired"
+    inv_repo = InvitationRepository(session)
+    updated = await inv_repo.update(invitation)
+    return _to_response(updated)
+
+
 @admin_router.get("", response_model=dict)
 async def list_invitations(
     request: Request,

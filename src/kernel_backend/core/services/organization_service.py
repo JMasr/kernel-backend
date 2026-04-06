@@ -73,3 +73,27 @@ class OrganizationService:
         if org is None:
             raise ValueError("Organization not found")
         await self._repo.delete(org_id)
+
+    async def list_members(
+        self, org_id: UUID, limit: int = 20, offset: int = 0
+    ) -> tuple[list[OrganizationMember], int]:
+        """Return (members, total_count) for an organization."""
+        members = await self._repo.list_members(org_id, limit=limit, offset=offset)
+        total = await self._repo.count_members(org_id)
+        return members, total
+
+    async def remove_member(self, org_id: UUID, user_id: str) -> None:
+        """Remove a user from an organization."""
+        if not await self._repo.get_organization_by_id(org_id):
+            raise ValueError("Organization not found")
+        await self._repo.remove_member(org_id, user_id)
+
+    async def update_member_role(
+        self, org_id: UUID, user_id: str, role: str
+    ) -> OrganizationMember:
+        """Change a member's role."""
+        if not await self._repo.get_organization_by_id(org_id):
+            raise ValueError("Organization not found")
+        if not await self._repo.get_member(org_id, user_id):
+            raise ValueError("Member not found")
+        return await self._repo.update_member_role(org_id, user_id, role)

@@ -42,3 +42,27 @@ class PaginatedOrganizationsResponse(BaseModel):
     total: int
     page: int
     total_pages: int
+
+
+class OrganizationMemberResponse(BaseModel):
+    id: UUID
+    org_id: UUID
+    user_id: str
+    role: str
+    created_at: datetime
+
+
+class PaginatedMembersResponse(BaseModel):
+    items: list[OrganizationMemberResponse]
+    total: int
+    page: int
+    total_pages: int
+
+
+class AddMemberRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=255)
+    role: str = Field("member", pattern="^(admin|member)$")
+
+
+class UpdateMemberRoleRequest(BaseModel):
+    role: str = Field(..., pattern="^(admin|member)$")

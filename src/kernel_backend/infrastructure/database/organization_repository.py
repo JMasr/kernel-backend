@@ -169,3 +169,47 @@ class OrganizationRepository(OrganizationPort):
     async def delete(self, org_id: UUID) -> None:
         await self._session.execute(sa_delete(OrgRecord).where(OrgRecord.id == org_id))
         await self._session.commit()
+
+    async def list_members(
+        self, org_id: UUID, limit: int = 20, offset: int = 0
+    ) -> list[OrganizationMember]:
+        result = await self._session.execute(
+            select(OrgMemberRecord)
+            .where(OrgMemberRecord.org_id == org_id)
+            .order_by(OrgMemberRecord.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return [_member_row_to_domain(r) for r in result.scalars().all()]
+
+    async def count_members(self, org_id: UUID) -> int:
+        result = await self._session.execute(
+            select(func.count()).select_from(OrgMemberRecord).where(OrgMemberRecord.org_id == org_id)
+        )
+        return result.scalar_one()
+
+    async def remove_member(self, org_id: UUID, user_id: str) -> None:
+        await self._session.execute(
+            sa_delete(OrgMemberRecord).where(
+                OrgMemberRecord.org_id == org_id,
+                OrgMemberRecord.user_id == user_id,
+            )
+        )
+        await self._session.commit()
+
+    async def update_member_role(
+        self, org_id: UUID, user_id: str, role: str
+    ) -> OrganizationMember:
+        await self._session.execute(
+            update(OrgMemberRecord)
+            .where(OrgMemberRecord.org_id == org_id, OrgMemberRecord.user_id == user_id)
+            .values(role=role)
+        )
+        await self._session.commit()
+        result = await self._session.execute(
+            select(OrgMemberRecord).where(
+                OrgMemberRecord.org_id == org_id,
+                OrgMemberRecord.user_id == user_id,
+            )
+        )
+        return _member_row_to_domain(result.scalar_one())
