@@ -79,6 +79,28 @@ class ResendEmailAdapter:
             html=html,
         )
 
+    async def send_new_lead(
+        self,
+        to_email: str,
+        lead_email: str,
+        lead_type: str,
+        message: str | None,
+        source_page: str | None,
+    ) -> None:
+        """Notify admin of a new inbound lead from the landing page."""
+        html = self._render("new_lead.html", {
+            "lead_email": lead_email,
+            "lead_type": lead_type,
+            "message": message or "—",
+            "source_page": source_page or "—",
+            "admin_link": f"{self._frontend_base_url}/admin",
+        })
+        self._send(
+            to=to_email,
+            subject=f"Nuevo lead: {lead_email} ({lead_type})",
+            html=html,
+        )
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------

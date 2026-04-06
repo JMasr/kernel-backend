@@ -151,3 +151,18 @@ class AudioFingerprint(Base):
     hash_hex = Column(String(16), nullable=False)
     is_original = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# Inbound leads (landing page CTA capture)
+# ---------------------------------------------------------------------------
+
+class LeadRecord(Base):
+    __tablename__ = "leads"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email = Column(String(255), nullable=False, index=True)
+    lead_type = Column(String(20), nullable=False)   # "customer" | "investor"
+    message = Column(Text, nullable=True)
+    source_page = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

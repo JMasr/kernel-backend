@@ -32,6 +32,8 @@ from kernel_backend.api.identity.router import router as identity_router
 from kernel_backend.api.admin.router import router as admin_users_router
 from kernel_backend.api.invitations.router import admin_router as invitations_admin_router
 from kernel_backend.api.invitations.router import public_router as invitations_public_router
+from kernel_backend.api.leads.router import admin_router as leads_admin_router
+from kernel_backend.api.leads.router import public_router as leads_public_router
 from kernel_backend.api.middleware.auth import HybridAuthMiddleware
 from kernel_backend.api.organizations.router import router as organizations_router
 from kernel_backend.api.public.router import router as public_verify_router
@@ -107,6 +109,8 @@ def create_app() -> FastAPI:
     app.include_router(admin_users_router)
     app.include_router(invitations_admin_router)
     app.include_router(invitations_public_router)
+    app.include_router(leads_public_router)
+    app.include_router(leads_admin_router)
     app.include_router(content_router)
     app.include_router(downloads_router)
     app.include_router(users_router)
