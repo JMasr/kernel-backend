@@ -24,7 +24,19 @@ class InvitationService:
         org_id: UUID,
         expires_at: datetime,
     ) -> Invitation:
-        """Create and persist a new invitation token."""
+        """Create and persist a new invitation token.
+
+        If a valid pending invitation for the same email + org already exists,
+        it is returned as-is (idempotent) so the caller can re-send the email
+        without creating duplicates.
+        """
+        # Return existing pending invitation if it is still valid
+        existing = await self._inv.get_pending_by_email_and_org(email, org_id)
+        if existing is not None and existing.is_valid:
+            org = await self._org.get_organization_by_id(org_id)
+            existing.org_name = org.name if org else None
+            return existing
+
         invitation = Invitation(
             id=uuid4(),
             token=uuid4(),

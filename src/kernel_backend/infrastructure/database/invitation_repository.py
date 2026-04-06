@@ -101,3 +101,21 @@ class InvitationRepository(InvitationPort):
             stmt = stmt.where(InvitationRecord.org_id == org_id)
         result = await self._session.execute(stmt)
         return result.scalar_one()
+
+    async def get_pending_by_email_and_org(self, email: str, org_id: UUID) -> Invitation | None:
+        result = await self._session.execute(
+            select(InvitationRecord, OrgRecord.name)
+            .outerjoin(OrgRecord, InvitationRecord.org_id == OrgRecord.id)
+            .where(
+                InvitationRecord.email == email,
+                InvitationRecord.org_id == org_id,
+                InvitationRecord.status == "pending",
+            )
+            .order_by(InvitationRecord.created_at.desc())
+            .limit(1)
+        )
+        row = result.one_or_none()
+        if row is None:
+            return None
+        inv_row, org_name = row
+        return _row_to_domain(inv_row, org_name=org_name)

@@ -333,6 +333,7 @@ class HybridAuthMiddleware(BaseHTTPMiddleware):
                     "x-stack-project-id": settings.NEON_AUTH_API_KEY,
                     "x-stack-secret-server-key": settings.NEON_AUTH_SECRET_SERVER_KEY,
                     "x-stack-access-type": "server",
+                    "x-stack-allow-restricted-user": "true",
                 },
             )
             elapsed_ms = (time.perf_counter() - t0) * 1000
