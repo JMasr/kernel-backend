@@ -29,3 +29,6 @@ class InvitationPort(ABC):
 
     @abstractmethod
     async def count(self, org_id: UUID | None = None) -> int: ...
+
+    @abstractmethod
+    async def get_pending_by_email_and_org(self, email: str, org_id: UUID) -> Invitation | None: ...

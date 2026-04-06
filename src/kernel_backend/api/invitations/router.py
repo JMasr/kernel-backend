@@ -22,6 +22,8 @@ from kernel_backend.infrastructure.database.organization_repository import Organ
 admin_router = APIRouter(prefix="/admin/invitations", tags=["admin"])
 public_router = APIRouter(prefix="/invitations", tags=["invitations"])
 
+_log = __import__("logging").getLogger("kernel.invitations")
+
 
 # ---------------------------------------------------------------------------
 # Schemas
@@ -115,8 +117,11 @@ async def create_invitation(
                 org_name=invitation.org_name or "Kernel Security",
                 invite_token=str(invitation.token),
             )
-    except Exception:
-        pass  # Email failure does not abort invitation creation
+    except Exception as exc:
+        _log.error(
+            "Failed to send invitation email to %s (token=%s): %s",
+            body.email, invitation.token, exc,
+        )
 
     return _to_response(invitation)
 
