@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"><title>Nuevo Lead</title></head>
+<body style="margin:0;padding:0;background:#0a0a0a;font-family:monospace;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0a0a0a;padding:40px 0;">
+    <tr>
+      <td align="center">
+        <table width="480" cellpadding="0" cellspacing="0" style="background:#111;border:1px solid #1f1f1f;padding:32px;">
+          <tr>
+            <td style="padding-bottom:24px;border-bottom:1px solid #1f1f1f;">
+              <p style="margin:0;font-size:10px;letter-spacing:0.15em;text-transform:uppercase;color:#4ade80;">KERNEL SECURITY</p>
+              <h1 style="margin:8px 0 0;font-size:18px;color:#e5e5e5;font-weight:700;letter-spacing:0.05em;">Nuevo Lead Entrante</h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:24px 0;">
+              <table width="100%" cellpadding="0" cellspacing="0">
+                <tr>
+                  <td style="padding:8px 0;color:#666;font-size:11px;text-transform:uppercase;letter-spacing:0.1em;width:100px;">Email</td>
+                  <td style="padding:8px 0;color:#e5e5e5;font-size:13px;font-weight:700;">{{ lead_email }}</td>
+                </tr>
+                <tr>
+                  <td style="padding:8px 0;color:#666;font-size:11px;text-transform:uppercase;letter-spacing:0.1em;">Tipo</td>
+                  <td style="padding:8px 0;color:#4ade80;font-size:12px;text-transform:uppercase;letter-spacing:0.1em;">{{ lead_type }}</td>
+                </tr>
+                <tr>
+                  <td style="padding:8px 0;color:#666;font-size:11px;text-transform:uppercase;letter-spacing:0.1em;vertical-align:top;">Mensaje</td>
+                  <td style="padding:8px 0;color:#aaa;font-size:12px;line-height:1.6;">{{ message }}</td>
+                </tr>
+                <tr>
+                  <td style="padding:8px 0;color:#666;font-size:11px;text-transform:uppercase;letter-spacing:0.1em;">Página</td>
+                  <td style="padding:8px 0;color:#aaa;font-size:12px;">{{ source_page }}</td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding-top:24px;border-top:1px solid #1f1f1f;text-align:center;">
+              <a href="{{ admin_link }}"
+                 style="display:inline-block;padding:10px 24px;background:#4ade80;color:#0a0a0a;font-size:10px;font-weight:700;letter-spacing:0.15em;text-transform:uppercase;text-decoration:none;">
+                VER TODOS LOS LEADS →
+              </a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
