@@ -29,6 +29,7 @@ _PUBLIC_PATHS = {
     ("GET", "/redoc"),
     ("POST", "/auth/login"),
     ("POST", "/auth/refresh"),
+    ("POST", "/leads"),
 }
 
 # Path *prefixes* that are always public (presigned downloads, invitation accept, health probes)
