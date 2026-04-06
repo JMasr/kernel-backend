@@ -57,3 +57,23 @@ class OrganizationPort(ABC):
     @abstractmethod
     async def delete(self, org_id: UUID) -> None:
         """Hard-delete an organization (cascades to members, keys, videos)."""
+
+    @abstractmethod
+    async def list_members(
+        self, org_id: UUID, limit: int = 20, offset: int = 0
+    ) -> list[OrganizationMember]:
+        """Return paginated members of an organization."""
+
+    @abstractmethod
+    async def count_members(self, org_id: UUID) -> int:
+        """Return total member count for an organization."""
+
+    @abstractmethod
+    async def remove_member(self, org_id: UUID, user_id: str) -> None:
+        """Remove a member from an organization."""
+
+    @abstractmethod
+    async def update_member_role(
+        self, org_id: UUID, user_id: str, role: str
+    ) -> OrganizationMember:
+        """Change a member's role and return the updated record."""

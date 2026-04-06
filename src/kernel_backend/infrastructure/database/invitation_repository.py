@@ -102,6 +102,18 @@ class InvitationRepository(InvitationPort):
         result = await self._session.execute(stmt)
         return result.scalar_one()
 
+    async def get_by_id(self, invitation_id: UUID) -> Invitation | None:
+        result = await self._session.execute(
+            select(InvitationRecord, OrgRecord.name)
+            .outerjoin(OrgRecord, InvitationRecord.org_id == OrgRecord.id)
+            .where(InvitationRecord.id == invitation_id)
+        )
+        row = result.one_or_none()
+        if row is None:
+            return None
+        inv_row, org_name = row
+        return _row_to_domain(inv_row, org_name=org_name)
+
     async def get_pending_by_email_and_org(self, email: str, org_id: UUID) -> Invitation | None:
         result = await self._session.execute(
             select(InvitationRecord, OrgRecord.name)

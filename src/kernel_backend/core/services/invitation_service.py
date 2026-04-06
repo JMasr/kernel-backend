@@ -56,6 +56,9 @@ class InvitationService:
     async def get_by_token(self, token: UUID) -> Invitation | None:
         return await self._inv.get_by_token(token)
 
+    async def get_by_id(self, invitation_id: UUID) -> Invitation | None:
+        return await self._inv.get_by_id(invitation_id)
+
     async def validate_token(self, token: UUID) -> Invitation | None:
         """Return the invitation if it exists and is still pending/not expired.
 
