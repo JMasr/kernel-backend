@@ -4,19 +4,29 @@ public_router:
   POST /leads — registers a new inbound lead (no auth required)
 
 admin_router:
-  GET  /admin/leads — paginated lead list (admin only)
+  GET    /admin/leads          — paginated lead list (admin only)
+  GET    /admin/investor-deck  — check if investor deck PDF is uploaded
+  POST   /admin/investor-deck  — upload investor deck PDF
+  DELETE /admin/investor-deck  — remove investor deck PDF
 """
 from __future__ import annotations
 
+import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import func, select
 
+from kernel_backend.core.ports.storage import StorageKeyNotFoundError
 from kernel_backend.infrastructure.database.models import LeadRecord
+
+_DECK_KEY = "investor-deck/deck.pdf"
+_DECK_META_KEY = "investor-deck/meta.json"
+_DECK_URL_EXPIRES = 3600  # 1 hour
+_DECK_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
 
 _log = logging.getLogger("kernel.leads")
 
@@ -55,6 +65,21 @@ class PaginatedLeadsResponse(BaseModel):
     total: int
     page: int
     total_pages: int
+
+
+class DeckStatusResponse(BaseModel):
+    exists: bool
+    size_bytes: int | None = None
+    uploaded_at: datetime | None = None
+
+
+class DeckUploadResponse(BaseModel):
+    status: str
+    size_bytes: int
+
+
+class DeckDeleteResponse(BaseModel):
+    status: str
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +137,19 @@ async def create_lead(body: CreateLeadRequest, request: Request) -> LeadResponse
     except Exception as exc:
         _log.error("Failed to send lead notification email: %s", exc)
 
-    return LeadResponse(status="ok")
+    # If investor lead, try to return a presigned deck download URL
+    deck_url: str | None = None
+    if body.lead_type == "investor":
+        try:
+            storage = request.app.state.storage
+            await storage.get(_DECK_META_KEY)  # raises if not uploaded yet
+            deck_url = await storage.presigned_download_url(_DECK_KEY, _DECK_URL_EXPIRES)
+        except StorageKeyNotFoundError:
+            pass  # deck not uploaded yet — return without URL
+        except Exception as exc:
+            _log.error("Failed to generate investor deck URL: %s", exc)
+
+    return LeadResponse(status="ok", deck_url=deck_url)
 
 
 # ---------------------------------------------------------------------------
@@ -161,3 +198,70 @@ async def list_leads(
         page=page,
         total_pages=max(1, (total + limit - 1) // limit),
     )
+
+
+# ---------------------------------------------------------------------------
+# Admin — Investor Deck endpoints
+# ---------------------------------------------------------------------------
+
+
+@admin_router.get("/investor-deck", response_model=DeckStatusResponse)
+async def get_investor_deck_status(request: Request) -> DeckStatusResponse:
+    """Return whether the investor deck PDF has been uploaded."""
+    if not getattr(request.state, "is_admin", False):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    storage = request.app.state.storage
+    try:
+        raw = await storage.get(_DECK_META_KEY)
+        meta = json.loads(raw)
+        return DeckStatusResponse(
+            exists=True,
+            size_bytes=meta.get("size_bytes"),
+            uploaded_at=datetime.fromisoformat(meta["uploaded_at"]) if meta.get("uploaded_at") else None,
+        )
+    except StorageKeyNotFoundError:
+        return DeckStatusResponse(exists=False)
+
+
+@admin_router.post("/investor-deck", response_model=DeckUploadResponse)
+async def upload_investor_deck(
+    request: Request,
+    file: UploadFile = File(...),
+) -> DeckUploadResponse:
+    """Upload (or replace) the investor deck PDF. Admin only."""
+    if not getattr(request.state, "is_admin", False):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    if file.content_type not in ("application/pdf", "application/octet-stream"):
+        raise HTTPException(status_code=422, detail="Only PDF files are accepted")
+
+    data = await file.read()
+    if len(data) > _DECK_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="File too large (max 20 MB)")
+
+    storage = request.app.state.storage
+    await storage.put(_DECK_KEY, data, "application/pdf")
+
+    meta = {
+        "size_bytes": len(data),
+        "uploaded_at": datetime.now(tz=timezone.utc).isoformat(),
+    }
+    await storage.put(_DECK_META_KEY, json.dumps(meta).encode(), "application/json")
+
+    _log.info("Investor deck uploaded: %d bytes", len(data))
+    return DeckUploadResponse(status="ok", size_bytes=len(data))
+
+
+@admin_router.delete("/investor-deck", response_model=DeckDeleteResponse)
+async def delete_investor_deck(request: Request) -> DeckDeleteResponse:
+    """Remove the investor deck PDF. Admin only."""
+    if not getattr(request.state, "is_admin", False):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    storage = request.app.state.storage
+    await storage.delete(_DECK_KEY)
+    await storage.delete(_DECK_META_KEY)
+
+    _log.info("Investor deck deleted")
+    return DeckDeleteResponse(status="ok")
