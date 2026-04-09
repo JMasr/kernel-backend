@@ -11,6 +11,10 @@ class AudioEmbeddingParams:
     psychoacoustic: bool           # True → psychoacoustic masking S2
     safety_margin_db: float        # margin below masking threshold (dB)
     target_snr_db: float           # SNR fallback if psychoacoustic=False
+    # Content-adaptive routing fields (backward-compatible defaults)
+    target_subband: str = "detail"       # "detail" | "approximation"
+    frame_length_ms: float = 0.0         # 0.0 = legacy 2s segments
+    pn_sequence_length: int = 0          # 0 = derive from chips_per_bit * 8
 
 
 @dataclass(frozen=True)
@@ -43,6 +47,10 @@ def embedding_params_from_dict(d: dict) -> EmbeddingParams:
         audio_data = dict(d["audio"])
         # tuple[int, ...] is stored as list in JSON — convert back
         audio_data["dwt_levels"] = tuple(audio_data["dwt_levels"])
+        # Backward-compatible defaults for content-adaptive fields
+        audio_data.setdefault("target_subband", "detail")
+        audio_data.setdefault("frame_length_ms", 0.0)
+        audio_data.setdefault("pn_sequence_length", 0)
         audio_obj = AudioEmbeddingParams(**audio_data)
     return EmbeddingParams(
         audio=audio_obj,
@@ -73,6 +81,7 @@ class VideoEntry:
     output_encoding_params: dict | None = None
     # Example: {'audio': {'codec': 'aac', 'bitrate': '256k', 'sample_rate': 44100},
     #           'video': {'codec': 'libx264', 'crf': 18, 'preset': 'ultrafast'}}
+    routing_metadata: dict | None = None  # RoutingDecision as dict, or None for legacy
 
 
 @dataclass(frozen=True)
@@ -92,6 +101,7 @@ class BandConfig:
     extra_dwt_levels: tuple[int, ...] = ()
     # extra_dwt_levels == () → single-band behaviour (v1)
     # extra_dwt_levels == (2,) with dwt_level=1 → embed in levels 1 and 2 (EGC)
+    target_subband: str = "detail"  # "detail" → coeffs[-2], "approximation" → coeffs[0]
 
 
 @dataclass(frozen=True)
