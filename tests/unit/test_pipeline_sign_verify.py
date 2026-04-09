@@ -46,7 +46,7 @@ from kernel_backend.core.services.signing_service import (
 from kernel_backend.core.services.verification_service import VerificationService
 from kernel_backend.infrastructure.media.media_service import MediaService
 from tests.helpers.fakes import FakeRegistry, FakeStorage
-from tests.helpers.signing_defaults import DEFAULT_AUDIO_PARAMS, DEFAULT_EMBEDDING_PARAMS, DEFAULT_VIDEO_PARAMS
+from tests.helpers.signing_defaults import DEFAULT_AUDIO_PARAMS, DEFAULT_AV_AUDIO_PARAMS, DEFAULT_EMBEDDING_PARAMS, DEFAULT_VIDEO_PARAMS
 
 PEPPER = b"pipeline-test-pepper-padded-32b!"
 
@@ -146,6 +146,7 @@ async def test_audio_sign_verify_roundtrip(synthetic_audio_120s: Path) -> None:
         registry=registry,
         pepper=PEPPER,
         media=media,
+        audio_params=DEFAULT_AUDIO_PARAMS,  # bypass content profiler for pipeline test
     )
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -234,6 +235,7 @@ async def test_av_sign_verify_roundtrip(synthetic_av_120s: Path) -> None:
         pepper=PEPPER,
         media=media,
         output_crf=0,  # lossless for synthetic correctness test
+        audio_params=DEFAULT_AV_AUDIO_PARAMS,  # bypass content profiler for pipeline test
     )
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
@@ -327,6 +329,7 @@ async def test_stored_params_match_defaults(synthetic_audio_120s: Path) -> None:
         registry=registry,
         pepper=PEPPER,
         media=MediaService(),
+        audio_params=DEFAULT_AUDIO_PARAMS,  # bypass content profiler for deterministic check
     )
 
     entry = registry._videos[result.content_id]

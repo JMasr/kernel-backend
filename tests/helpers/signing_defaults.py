@@ -10,12 +10,14 @@ from kernel_backend.core.domain.dsp_manifest import (
 )
 from kernel_backend.core.services.signing_service import (
     _DEFAULT_AUDIO_PARAMS as DEFAULT_AUDIO_PARAMS,
+    _DEFAULT_AV_AUDIO_PARAMS as DEFAULT_AV_AUDIO_PARAMS,
     _DEFAULT_VIDEO_PARAMS as DEFAULT_VIDEO_PARAMS,
     _DEFAULT_EMBEDDING_PARAMS as DEFAULT_EMBEDDING_PARAMS,
 )
 
 __all__ = [
     "DEFAULT_AUDIO_PARAMS",
+    "DEFAULT_AV_AUDIO_PARAMS",
     "DEFAULT_VIDEO_PARAMS",
     "DEFAULT_EMBEDDING_PARAMS",
     "DSPManifest",

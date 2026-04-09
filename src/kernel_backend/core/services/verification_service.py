@@ -356,10 +356,12 @@ class VerificationService:
         stored_manifest = _manifest_from_json(entry.manifest_json) if entry.manifest_json else None
 
         # Phase B — extract audio WID via DSSS
+        _ap = entry.embedding_params.audio
         decoded_wid, decodable, n_seg, n_dec, n_era = self._extract_audio_wid(
             media_path, media, content_id, author_public_key, entry.rs_n, pepper,
-            chips_per_bit=entry.embedding_params.audio.chips_per_bit,
-            force_levels=list(entry.embedding_params.audio.dwt_levels),
+            chips_per_bit=_ap.chips_per_bit,
+            force_levels=list(_ap.dwt_levels),
+            target_subband=_ap.target_subband,
         )
 
         if not decodable:
@@ -476,11 +478,13 @@ class VerificationService:
         stored_manifest = _manifest_from_json(entry.manifest_json) if entry.manifest_json else None
 
         # Phase B — extract audio WID
+        _ap_av = entry.embedding_params.audio
         (audio_wid, audio_decodable,
          audio_n_seg, audio_n_dec, audio_n_era) = self._extract_audio_wid(
             media_path, media, content_id, author_public_key, entry.rs_n, pepper,
-            chips_per_bit=entry.embedding_params.audio.chips_per_bit,
-            force_levels=list(entry.embedding_params.audio.dwt_levels),
+            chips_per_bit=_ap_av.chips_per_bit,
+            force_levels=list(_ap_av.dwt_levels),
+            target_subband=_ap_av.target_subband,
         )
 
         # Phase B — extract video WID
@@ -539,18 +543,21 @@ class VerificationService:
         pepper: bytes,
         chips_per_bit: int = 256,
         force_levels: list[int] | None = None,
+        target_subband: str = "detail",
     ) -> tuple[bytes | None, bool, int, int, int]:
         """
         Extract audio WID via DSSS correlation over each 2-second segment.
         Returns (decoded_wid, decodable, n_segments, n_decoded, n_erasures).
         decoded_wid is None and decodable is False when RS decode fails.
 
-        chips_per_bit and force_levels should be read from entry.embedding_params.audio
-        to reconstruct the exact pipeline used at sign time.
+        chips_per_bit, force_levels, and target_subband should be read from
+        entry.embedding_params.audio to reconstruct the exact pipeline used
+        at sign time.
         """
         band_configs = plan_audio_hopping(
             rs_n, content_id, author_public_key, pepper,
             force_levels=force_levels,
+            target_subband=target_subband,
         )
         symbols: list[int | None] = []
         erasure_positions: list[int] = []
