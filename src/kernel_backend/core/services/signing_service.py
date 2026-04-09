@@ -640,6 +640,22 @@ def _sign_av_cpu(
         ap = routing_decision_to_audio_params(routing)
         routing_meta = routing_decision_to_dict(routing)
 
+        # Silent audio track → delegate to video-only pipeline (audio WID
+        # cannot survive on a silent carrier, so embedding it only produces
+        # false-RED verdicts on verification).
+        if content_profile.content_type == "silence":
+            import logging
+            logging.getLogger(__name__).warning(
+                "Audio track classified as silence (conf=%.2f) — "
+                "falling back to video-only signing pipeline.",
+                content_profile.confidence,
+            )
+            return _sign_video_cpu(
+                media_path, certificate, private_key_pem, pepper, media,
+                org_id=org_id, original_filename=original_filename,
+                video_params=video_params, output_crf=output_crf,
+            )
+
     # 2–3. IDs + content hash
     content_id = str(uuid4())
     content_hash = hashlib.sha256(media_path.read_bytes()).hexdigest()

@@ -17,6 +17,8 @@ Usage:
     uv run python scripts/listening_test.py --polygon --all        # audio + video
     uv run python scripts/listening_test.py --polygon --video-only # video only
     uv run python scripts/listening_test.py --polygon --all --out-dir /tmp/inspect
+    uv run python scripts/listening_test.py --librosa              # librosa samples only
+    uv run python scripts/listening_test.py --polygon --librosa    # polygon + librosa
 
     # Custom watermark energy (sweep calibration):
     uv run python scripts/listening_test.py --polygon --audio-snr -26.0
@@ -66,6 +68,8 @@ from kernel_backend.core.services.signing_service import (
     sign_video,
 )
 from kernel_backend.core.services.verification_service import VerificationService
+from kernel_backend.engine.audio.content_profiler import profile_audio
+from kernel_backend.engine.audio.algorithm_router import route as route_audio
 from kernel_backend.infrastructure.media.media_service import MediaService
 
 
@@ -180,6 +184,13 @@ POLYGON_VIDEO_CLIPS = {
     "show_01":          POLYGON_DIR / "video" / "others"        / "show.mp4",
 }
 
+LIBROSA_AUDIO_CLIPS = [
+    "brahms", "choice", "fishin", "humpback",
+    "nutcracker", "pistachio", "vibeace",
+    "libri1", "libri2", "libri3",
+    "trumpet", "robin",
+]
+
 AUDIO_MIN_S = 34.0   # 17 segments × 2 s
 VIDEO_MIN_S = 85.0   # 17 segments × 5 s
 
@@ -276,6 +287,11 @@ class ClipResult:
     sign_error: str | None
     conditions: list[ConditionResult] = field(default_factory=list)
     short_clip_warning: str | None = None
+    # Content-adaptive routing info
+    content_type: str | None = None
+    content_confidence: float | None = None
+    routing_reason: str | None = None
+    routing_params: dict | None = None
 
 
 # ── Core E2E processing ────────────────────────────────────────────────────────
@@ -316,6 +332,27 @@ async def process_clip(
             f" — WID RS recovery requires ≥17 segments"
         )
 
+    # ── Content profiling (informational — signing does this internally too) ──
+    content_type_str: str | None = None
+    content_confidence: float | None = None
+    routing_reason: str | None = None
+    routing_params_dict: dict | None = None
+    if clip_type in ("audio", "av") and not audio_params:
+        try:
+            import librosa as _lr
+            import numpy as _np
+            _samples, _ = _lr.load(path, sr=22050, mono=True)
+            _cp = profile_audio(_samples, 22050)
+            _rd = route_audio(_cp)
+            content_type_str = _cp.content_type
+            content_confidence = _cp.confidence
+            routing_reason = _rd.reason
+            routing_params_dict = _rd.parameters
+            print(f"  [{name}] profiled → {_cp.content_type} "
+                  f"(conf={_cp.confidence:.2f}) → {_rd.reason}")
+        except Exception as exc:
+            print(f"  [{name}] profiling failed: {exc}")
+
     # ── Sign ──────────────────────────────────────────────────────────────────
     print(f"  [{name}] signing ({clip_type}, {duration_s:.1f} s)...")
     t0 = time.perf_counter()
@@ -352,6 +389,10 @@ async def process_clip(
             signed_path=None, signed_size_mb=0.0,
             sign_time_s=sign_time, sign_error=sign_error,
             short_clip_warning=short_warning,
+            content_type=content_type_str,
+            content_confidence=content_confidence,
+            routing_reason=routing_reason,
+            routing_params=routing_params_dict,
         )
 
     # Save signed output
@@ -364,6 +405,23 @@ async def process_clip(
     )
 
     # ── Verify under each degradation condition ────────────────────────────────
+    # Use active_signals to determine the effective signed type — silence
+    # fallback may have downgraded "av" to video-only.
+    signals = set(result.active_signals)
+    has_audio_signal = any("audio" in s for s in signals)
+    has_video_signal = any("video" in s for s in signals)
+    if has_audio_signal and has_video_signal:
+        verify_type = "av"
+    elif has_video_signal:
+        verify_type = "video"
+    else:
+        verify_type = "audio"
+
+    if verify_type != clip_type:
+        print(f"  [{name}] note: signed as {verify_type} "
+              f"(original was {clip_type})")
+        clip_type = verify_type
+
     svc = VerificationService()
     conditions = VIDEO_CONDITIONS if clip_type in ("video", "av") else AUDIO_CONDITIONS
     condition_results: list[ConditionResult] = []
@@ -456,6 +514,10 @@ async def process_clip(
         signed_path=signed_path, signed_size_mb=signed_size_mb,
         sign_time_s=sign_time, sign_error=None,
         conditions=condition_results, short_clip_warning=short_warning,
+        content_type=content_type_str,
+        content_confidence=content_confidence,
+        routing_reason=routing_reason,
+        routing_params=routing_params_dict,
     )
 
 
@@ -513,6 +575,19 @@ def make_report(
         lines.append("")
         for r in audio_results:
             lines.append(f"### {r.name}  [WAV · {r.duration_s:.1f} s · AUDIO-ONLY]")
+            if r.content_type:
+                conf = f"{r.content_confidence:.2f}" if r.content_confidence else "?"
+                lines.append(
+                    f"Routing: {r.content_type} (conf={conf})"
+                    f"  → {r.routing_reason or 'n/a'}"
+                )
+                if r.routing_params:
+                    p = r.routing_params
+                    lines.append(
+                        f"  dwt_levels={p.get('dwt_levels')}"
+                        f"  subband={p.get('target_subband')}"
+                        f"  snr={p.get('target_snr_db')} dB"
+                    )
             if r.short_clip_warning:
                 lines.append(r.short_clip_warning)
             if r.sign_error:
@@ -557,6 +632,19 @@ def make_report(
         for r in video_results:
             type_label = "AV" if r.clip_type == "av" else "VIDEO-ONLY"
             lines.append(f"### {r.name}  [MP4 · {r.duration_s:.1f} s · {type_label}]")
+            if r.content_type:
+                conf = f"{r.content_confidence:.2f}" if r.content_confidence else "?"
+                lines.append(
+                    f"Routing: {r.content_type} (conf={conf})"
+                    f"  → {r.routing_reason or 'n/a'}"
+                )
+                if r.routing_params:
+                    p = r.routing_params
+                    lines.append(
+                        f"  dwt_levels={p.get('dwt_levels')}"
+                        f"  subband={p.get('target_subband')}"
+                        f"  snr={p.get('target_snr_db')} dB"
+                    )
             if r.short_clip_warning:
                 lines.append(r.short_clip_warning)
             if r.sign_error:
@@ -629,13 +717,16 @@ def make_report(
     video_extra = VIDEO_CONDITIONS[1:]
     all_extra = list(dict.fromkeys(audio_extra + video_extra))
 
-    hdr = f"  {'Clip':<22} │ {'Type':5} │ {'Dur':>6} │ {'Signed':6} │ {'clean':>8}"
+    hdr = (
+        f"  {'Clip':<22} │ {'Type':5} │ {'Dur':>6} │ {'Routed':<12} │"
+        f" {'Signed':6} │ {'clean':>8}"
+    )
     for cond in all_extra:
         hdr += f" │ {cond[:9]:>9}"
     lines.append(hdr)
     sep = (
         "  " + "─" * 22 + "┼" + "─" * 7 + "┼" + "─" * 8
-        + "┼" + "─" * 8 + "┼" + "─" * 10
+        + "┼" + "─" * 14 + "┼" + "─" * 8 + "┼" + "─" * 10
         + ("┼" + "─" * 11) * len(all_extra)
     )
     lines.append(sep)
@@ -647,9 +738,11 @@ def make_report(
             "✓ VERIFIED" if (clean and clean.verdict == "VERIFIED")
             else ("✗ RED" if (clean and clean.verdict == "RED") else "✗ ERROR" if clean else "n/a")
         )
+        routed_str = r.content_type or "—"
         row = (
             f"  {r.name:<22} │ {r.clip_type.upper():5} │"
             f" {r.duration_s:>5.0f}s │"
+            f" {routed_str:<12} │"
             f" {'✗ FAIL' if r.sign_error else '✓ OK':<6} │"
             f" {clean_str:>8}"
         )
@@ -736,22 +829,43 @@ async def _async_main(args: argparse.Namespace) -> None:
 
     clips: list[tuple[str, Path]] = []
 
-    if not args.video_only:
+    if args.polygon and not args.video_only:
         for name, path in POLYGON_AUDIO_CLIPS.items():
             if path.exists():
                 clips.append((name, path))
             else:
                 print(f"  [SKIP] {name}: not found at {path}")
 
-    if args.all or args.video_only:
+    if args.polygon and (args.all or args.video_only):
         for name, path in POLYGON_VIDEO_CLIPS.items():
             if path.exists():
                 clips.append((name, path))
             else:
                 print(f"  [SKIP] {name}: not found at {path}")
 
+    # ── Librosa sample clips (converted OGG → WAV on the fly) ────────────────
+    if args.librosa:
+        import librosa as _lr
+        import soundfile as _sf
+        wav_dir = output_dir / "librosa_wav"
+        wav_dir.mkdir(parents=True, exist_ok=True)
+        for sample_name in LIBROSA_AUDIO_CLIPS:
+            try:
+                ogg_path = _lr.ex(sample_name)
+                wav_path = wav_dir / f"{sample_name}.wav"
+                if not wav_path.exists():
+                    y, sr = _lr.load(ogg_path, sr=44100, mono=True)
+                    _sf.write(str(wav_path), y, sr)
+                    print(f"  [librosa] converted {sample_name} → {wav_path.name}"
+                          f"  ({len(y)/sr:.1f}s)")
+                else:
+                    print(f"  [librosa] cached {sample_name} → {wav_path.name}")
+                clips.append((f"librosa_{sample_name}", wav_path))
+            except Exception as exc:
+                print(f"  [SKIP] librosa/{sample_name}: {exc}")
+
     if not clips:
-        print("No clips found. Check data/ directory and run setup_polygon_audio.py.")
+        print("No clips found. Use --polygon, --librosa, or both.")
         return
 
     results: list[ClipResult] = []
@@ -776,8 +890,12 @@ def main() -> None:
         description="End-to-End Watermark Inspection Tool",
     )
     parser.add_argument(
-        "--polygon", action="store_true", required=True,
+        "--polygon", action="store_true",
         help="Use polygon clips from data/",
+    )
+    parser.add_argument(
+        "--librosa", action="store_true",
+        help="Include librosa example audio samples (brahms, vibeace, etc.)",
     )
     parser.add_argument(
         "--all", action="store_true",
@@ -800,6 +918,8 @@ def main() -> None:
         help="Output directory (default: scripts/output/listening_test/)",
     )
     args = parser.parse_args()
+    if not args.polygon and not args.librosa:
+        parser.error("at least one of --polygon or --librosa is required")
     asyncio.run(_async_main(args))
 
 
