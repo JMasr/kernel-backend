@@ -68,6 +68,7 @@ class Video(Base):
     schema_version = Column(Integer, server_default=text("2"), nullable=False)
     embedding_params = Column(JSON, nullable=True)  # JSONB on Postgres, JSON on SQLite
     output_encoding_params = Column(JSON, nullable=True)  # codec/CRF/bitrate at sign time; null for pre-sprint content
+    routing_metadata = Column(JSON, nullable=True)  # ContentProfiler routing decision; null for legacy content
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True, index=True)
 

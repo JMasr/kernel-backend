@@ -148,6 +148,7 @@ def _video_row_to_entry(row: Video) -> VideoEntry:
         org_id=row.org_id,
         signed_media_key=row.signed_storage_key or "",
         output_encoding_params=row.output_encoding_params,
+        routing_metadata=row.routing_metadata,
     )
 
 
@@ -172,6 +173,7 @@ class VideoRepository:
                 signed_storage_key=entry.signed_media_key if entry.signed_media_key else None,
                 embedding_params=embedding_params_to_dict(entry.embedding_params),
                 output_encoding_params=entry.output_encoding_params,
+                routing_metadata=entry.routing_metadata,
             )
             .on_conflict_do_nothing(index_elements=["content_id"])
         )
@@ -203,6 +205,7 @@ class VideoRepository:
                 signed_storage_key=entry.signed_media_key if entry.signed_media_key else None,
                 embedding_params=embedding_params_to_dict(entry.embedding_params),
                 output_encoding_params=entry.output_encoding_params,
+                routing_metadata=entry.routing_metadata,
             )
             .on_conflict_do_nothing(index_elements=["content_id"])
         )
