@@ -71,9 +71,12 @@ def embed_segment(
     # intended 1/sqrt(n_bands) energy conservation scaling.
     result = segment.astype(np.float64)
 
+    # Subband selection: "detail" → coeffs[-2] (legacy), "approximation" → coeffs[0]
+    _band_idx = 0 if band_config.target_subband == "approximation" else -2
+
     for level in all_levels:
         coeffs = pywt.wavedec(result, "db4", level=level, mode="periodization")
-        band = coeffs[-2].copy()
+        band = coeffs[_band_idx].copy()
 
         band_rms = float(np.sqrt(np.mean(band ** 2)))
         if band_rms < 1e-10:
@@ -154,7 +157,7 @@ def embed_segment(
                     if remainder > 0:
                         band[start:] += chips[:remainder] * amplitude
 
-        coeffs[-2] = band
+        coeffs[_band_idx] = band
         result = _trim_or_pad(pywt.waverec(coeffs, "db4", mode="periodization"), orig_len)
 
     return result.astype(np.float32)
@@ -178,7 +181,8 @@ def extract_segment(
     """
     level = band_config.dwt_level
     coeffs = pywt.wavedec(segment.astype(np.float64), "db4", level=level, mode="periodization")
-    band = coeffs[-2].astype(np.float64)
+    band_idx = 0 if band_config.target_subband == "approximation" else -2
+    band = coeffs[band_idx].astype(np.float64)
 
     n_chips = 8 * chips_per_bit
     pn = pn_sequence(n_chips, pn_seed)
@@ -218,9 +222,11 @@ def extract_symbol_segment(
     n_chips = 8 * chips_per_bit
     pn = pn_sequence(n_chips, pn_seed)
 
+    band_idx = 0 if band_config.target_subband == "approximation" else -2
+
     for level in all_levels:
         coeffs = pywt.wavedec(segment.astype(np.float64), "db4", level=level, mode="periodization")
-        band = coeffs[-2].astype(np.float64)
+        band = coeffs[band_idx].astype(np.float64)
 
         if len(band) < chips_per_bit:
             continue

@@ -14,6 +14,7 @@ def plan_audio_hopping(
     author_pubkey: str,
     pepper: bytes,
     force_levels: list[int] | None = None,
+    target_subband: str = "detail",
 ) -> list[BandConfig]:
     """
     Per-segment DWT band config for audio WID embedding.
@@ -42,6 +43,7 @@ def plan_audio_hopping(
                 coeff_positions=[],
                 dwt_level=primary,
                 extra_dwt_levels=extra,
+                target_subband=target_subband,
             ))
         else:
             msg = f"audio_hop|{content_id}|{author_pubkey}|{i}".encode()
@@ -54,6 +56,7 @@ def plan_audio_hopping(
                 coeff_positions=[],
                 dwt_level=dwt_level,
                 extra_dwt_levels=(),
+                target_subband=target_subband,
             ))
     return configs
 
