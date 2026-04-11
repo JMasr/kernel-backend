@@ -24,6 +24,8 @@ class VideoEmbeddingParams:
     qim_step_min: float            # minimum step (H.264 survival)
     qim_step_max: float            # maximum step (dark blocks)
     qim_quantize_to: float         # step quantization granularity
+    min_block_variance: float = 0.0   # 0 = no filtering (backward compatible)
+    block_oversample: int = 1         # 1 = no oversampling (backward compatible)
 
 
 @dataclass(frozen=True)
@@ -52,9 +54,15 @@ def embedding_params_from_dict(d: dict) -> EmbeddingParams:
         audio_data.setdefault("frame_length_ms", 0.0)
         audio_data.setdefault("pn_sequence_length", 0)
         audio_obj = AudioEmbeddingParams(**audio_data)
+    video_obj = None
+    if d.get("video"):
+        video_data = dict(d["video"])
+        video_data.setdefault("min_block_variance", 0.0)
+        video_data.setdefault("block_oversample", 1)
+        video_obj = VideoEmbeddingParams(**video_data)
     return EmbeddingParams(
         audio=audio_obj,
-        video=VideoEmbeddingParams(**d["video"]) if d.get("video") else None,
+        video=video_obj,
     )
 
 

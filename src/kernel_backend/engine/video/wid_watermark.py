@@ -106,8 +106,16 @@ def embed_video_frame(
     """
     coeffs_list = _coeff_set(content_id, author_public_key, segment_idx, pepper)
     h, w = frame.shape[:2]
-    blocks = _select_blocks(h, w, content_id, author_public_key, segment_idx, pepper)
-    if not blocks:
+
+    # Extract block-selection params (default = no filtering)
+    oversample = jnd_params.block_oversample if jnd_params else 1
+    min_var = jnd_params.min_block_variance if jnd_params else 0.0
+
+    candidates = _select_blocks(
+        h, w, content_id, author_public_key, segment_idx, pepper,
+        oversample=oversample,
+    )
+    if not candidates:
         return frame.copy()
 
     ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
@@ -123,11 +131,18 @@ def embed_video_frame(
         step_base = step_min = step_max = QIM_STEP_WID
         quantize_to = 1.0
 
-    for block_idx, (y0, x0) in enumerate(blocks):
+    # Iterate over ALL candidates; use cand_idx for bit mapping so that
+    # embed and extract stay aligned even when variance filtering excludes
+    # slightly different blocks after H.264 (candidate index is stable).
+    for cand_idx, (y0, x0) in enumerate(candidates):
         if y0 + BLOCK_SIZE > h or x0 + BLOCK_SIZE > w:
             continue
 
         block = y_float[y0:y0 + BLOCK_SIZE, x0:x0 + BLOCK_SIZE].copy()
+
+        # Skip low-variance blocks inline (energy-adaptive selection)
+        if min_var > 0 and float(np.var(block)) < min_var:
+            continue
 
         # Compute adaptive step BEFORE modifying the block
         if use_jnd_adaptive:
@@ -139,7 +154,7 @@ def embed_video_frame(
             step = QIM_STEP_WID
 
         dct_block = cv2.dct(block)
-        bit = int(symbol_bits[block_idx % 8])
+        bit = int(symbol_bits[cand_idx % 8])
         for cr, cc in coeffs_list:
             dct_block[cr, cc] = _qim_embed(dct_block[cr, cc], bit, step)
         y_float[y0:y0 + BLOCK_SIZE, x0:x0 + BLOCK_SIZE] = cv2.idct(dct_block)
@@ -187,23 +202,37 @@ def extract_segment(
         step_base = step_min = step_max = QIM_STEP_WID
         quantize_to = 1.0
 
+    # Extract block selection params
+    oversample = jnd_params.block_oversample if jnd_params else 1
+    min_var = jnd_params.min_block_variance if jnd_params else 0.0
+
     # Accumulate votes per bit position: votes[bit_pos][0/1]
     votes = np.zeros((8, 2), dtype=np.int32)
 
     for frame in frames:
         h, w = frame.shape[:2]
-        blocks = _select_blocks(h, w, content_id, author_public_key, segment_idx, pepper)
-        if not blocks:
+        candidates = _select_blocks(
+            h, w, content_id, author_public_key, segment_idx, pepper,
+            oversample=oversample,
+        )
+        if not candidates:
             continue
 
         ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
         y_float = ycrcb[:, :, 0].astype(np.float32)
 
-        for block_idx, (y0, x0) in enumerate(blocks):
+        # Iterate ALL candidates; use cand_idx for bit mapping (stable
+        # across embed/extract even when borderline blocks disagree).
+        for cand_idx, (y0, x0) in enumerate(candidates):
             if y0 + BLOCK_SIZE > h or x0 + BLOCK_SIZE > w:
                 continue
-            bit_pos = block_idx % 8
             block = y_float[y0:y0 + BLOCK_SIZE, x0:x0 + BLOCK_SIZE].copy()
+
+            # Skip low-variance blocks inline
+            if min_var > 0 and float(np.var(block)) < min_var:
+                continue
+
+            bit_pos = cand_idx % 8
             dct_block = cv2.dct(block)
 
             if use_jnd_adaptive:
@@ -272,18 +301,21 @@ def _select_blocks(
     segment_idx: int,
     pepper: bytes,
     n_blocks: int = N_WID_BLOCKS_PER_SEGMENT,
+    oversample: int = 1,
 ) -> list[tuple[int, int]]:
     """
     Deterministic block selection (normalized coordinates → pixel coords).
     Same normalization invariant as pilot_tone._select_blocks.
+
+    When oversample > 1, generates n_blocks * oversample candidates.
+    Caller is responsible for filtering down to n_blocks.
     """
     n_rows = height // BLOCK_SIZE
     n_cols = width // BLOCK_SIZE
     total = n_rows * n_cols
 
-    if total < n_blocks:
-        n_blocks = total
-    if n_blocks == 0:
+    n_candidates = min(n_blocks * oversample, total)
+    if n_candidates == 0:
         return []
 
     msg = f"wid_blocks|{content_id}|{author_public_key}|{segment_idx}".encode()
@@ -291,13 +323,68 @@ def _select_blocks(
     seed = int.from_bytes(digest[:8], "big")
     rng = np.random.default_rng(seed)
 
-    norm_positions = rng.random((n_blocks, 2))
+    norm_positions = rng.random((n_candidates, 2))
     result = []
     for ny, nx in norm_positions:
         row = min(int(ny * n_rows), n_rows - 1)
         col = min(int(nx * n_cols), n_cols - 1)
         result.append((row * BLOCK_SIZE, col * BLOCK_SIZE))
     return result
+
+
+_MIN_USABLE_BLOCKS = 16
+
+
+def _filter_blocks_by_variance(
+    candidates: list[tuple[int, int]],
+    y_channel: np.ndarray,
+    min_variance: float,
+    n_blocks: int,
+) -> list[tuple[int, int]]:
+    """Filter candidate blocks by luma variance, preserving HMAC order.
+
+    Blocks with variance >= min_variance are kept (in original order).
+    If fewer than _MIN_USABLE_BLOCKS pass, falls back to top-N by variance
+    (re-sorted into original HMAC order).
+
+    HMAC order preservation is critical: block_idx % 8 determines bit position.
+
+    Args:
+        candidates: block positions from _select_blocks (HMAC-ordered)
+        y_channel: Y channel as float32, shape (H, W)
+        min_variance: minimum block variance threshold
+        n_blocks: maximum number of blocks to return
+
+    Returns:
+        Filtered block list, subsequence of candidates, len <= n_blocks.
+    """
+    if min_variance <= 0:
+        return candidates[:n_blocks]
+
+    # Compute variance for each candidate
+    variances = []
+    for y0, x0 in candidates:
+        block = y_channel[y0:y0 + BLOCK_SIZE, x0:x0 + BLOCK_SIZE]
+        variances.append(float(np.var(block)))
+
+    # Filter by threshold, preserving order
+    passed = [
+        (i, candidates[i])
+        for i, v in enumerate(variances)
+        if v >= min_variance
+    ]
+
+    if len(passed) >= _MIN_USABLE_BLOCKS:
+        return [pos for _, pos in passed[:n_blocks]]
+
+    # Fallback: top-N by variance, re-sorted into HMAC order
+    indexed = sorted(
+        range(len(candidates)),
+        key=lambda i: variances[i],
+        reverse=True,
+    )
+    top_n = sorted(indexed[:max(n_blocks, _MIN_USABLE_BLOCKS)])
+    return [candidates[i] for i in top_n[:n_blocks]]
 
 
 def _compute_adaptive_step(

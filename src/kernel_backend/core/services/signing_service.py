@@ -30,6 +30,9 @@ from kernel_backend.core.ports.registry import RegistryPort
 from kernel_backend.core.ports.storage import StoragePort
 from kernel_backend.core.services.crypto_service import derive_wid, sign_manifest
 from kernel_backend.core.domain.content_profile import routing_decision_to_dict
+from kernel_backend.core.domain.video_content_profile import (
+    video_routing_decision_to_dict as _video_routing_to_dict,
+)
 from kernel_backend.engine.audio.algorithm_router import (
     route as route_audio,
     routing_decision_to_audio_params,
@@ -39,6 +42,11 @@ from kernel_backend.engine.audio.content_profiler import (
     SUBSAMPLE_N_SEGMENTS,
     SUBSAMPLE_THRESHOLD_S,
     profile_audio,
+)
+from kernel_backend.engine.video.content_profiler import profile_video as _profile_video
+from kernel_backend.engine.video.algorithm_router import (
+    route as _route_video,
+    video_routing_decision_to_video_params as _video_routing_to_params,
 )
 from kernel_backend.engine.audio.fingerprint import (
     extract_hashes as extract_audio_hashes,
@@ -281,6 +289,49 @@ def _load_profiling_segments(media_path: Path, duration_s: float) -> list[np.nda
     return segments
 
 
+def _sample_video_frames(
+    media_path: Path,
+    media: MediaPort,
+    n_frames: int = 5,
+) -> list[np.ndarray]:
+    """Sample representative BGR frames for video content profiling.
+
+    Grabs frames at positions [10%, 25%, 50%, 75%, 90%] of the video.
+    Uses iter_video_segments with large stride to minimize I/O.
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(str(media_path))
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            total_frames = 300  # fallback
+
+        positions = [0.10, 0.25, 0.50, 0.75, 0.90]
+        frame_indices = [int(p * total_frames) for p in positions[:n_frames]]
+
+        frames: list[np.ndarray] = []
+        for idx in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                frames.append(frame)
+
+        if not frames:
+            # Fallback: read first frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                frames.append(frame)
+
+        if not frames:
+            raise ValueError("Could not read any frames from video for profiling")
+
+        return frames
+    finally:
+        cap.release()
+
+
 # ── CPU phases ────────────────────────────────────────────────────────────────
 # These sync helpers perform all DSP work and write the signed file to a temp
 # path. They return a RawSigningPayload dict — no async, no storage, no DB.
@@ -478,11 +529,21 @@ def _sign_video_cpu(
     output_crf: int | None = None,
 ) -> RawSigningPayload:
     """CPU phase of video signing. Returns a serialisable RawSigningPayload."""
-    vp = video_params or _DEFAULT_VIDEO_PARAMS
     # 1. Probe — reject audio-only containers
     profile = media.probe(media_path)
     if not profile.has_video:
         raise ValueError("Container has no video track — cannot sign video-only pipeline")
+
+    # 1b. Video content profiling + adaptive routing
+    video_routing_meta: dict | None = None
+    if video_params is not None:
+        vp = video_params
+    else:
+        sample_frames = _sample_video_frames(media_path, media)
+        video_profile = _profile_video(sample_frames)
+        video_routing = _route_video(video_profile)
+        vp = _video_routing_to_params(video_routing)
+        video_routing_meta = _video_routing_to_dict(video_routing)
 
     # 2–3. IDs and content hash
     content_id = str(uuid4())
@@ -604,6 +665,10 @@ def _sign_video_cpu(
         output_encoding_params={
             "video": {"codec": "libx264", "crf": crf_to_use, "preset": "ultrafast"},
         },
+        routing_metadata=(
+            {"version": 2, "video": video_routing_meta}
+            if video_routing_meta is not None else None
+        ),
     )
 
 
@@ -620,7 +685,6 @@ def _sign_av_cpu(
     output_crf: int | None = None,
 ) -> RawSigningPayload:
     """CPU phase of AV signing (single shared WID). Returns a serialisable RawSigningPayload."""
-    vp = video_params or _DEFAULT_VIDEO_PARAMS
     # 1. Probe — require both tracks
     profile = media.probe(media_path)
     if not profile.has_video or not profile.has_audio:
@@ -630,7 +694,7 @@ def _sign_av_cpu(
         )
 
     # 1b. Content profiling + adaptive routing for audio track
-    routing_meta: dict | None = None
+    audio_routing_meta: dict | None = None
     if audio_params is not None:
         ap = audio_params
     else:
@@ -638,7 +702,7 @@ def _sign_av_cpu(
         content_profile = profile_audio(np.concatenate(profiling_segments), 22050)
         routing = route_audio(content_profile)
         ap = routing_decision_to_audio_params(routing)
-        routing_meta = routing_decision_to_dict(routing)
+        audio_routing_meta = routing_decision_to_dict(routing)
 
         # Silent audio track → delegate to video-only pipeline (audio WID
         # cannot survive on a silent carrier, so embedding it only produces
@@ -655,6 +719,26 @@ def _sign_av_cpu(
                 org_id=org_id, original_filename=original_filename,
                 video_params=video_params, output_crf=output_crf,
             )
+
+    # 1c. Video content profiling + adaptive routing
+    video_routing_meta: dict | None = None
+    if video_params is not None:
+        vp = video_params
+    else:
+        sample_frames = _sample_video_frames(media_path, media)
+        video_profile = _profile_video(sample_frames)
+        video_routing = _route_video(video_profile)
+        vp = _video_routing_to_params(video_routing)
+        video_routing_meta = _video_routing_to_dict(video_routing)
+
+    # Merge audio + video routing metadata
+    routing_meta: dict | None = None
+    if audio_routing_meta is not None or video_routing_meta is not None:
+        routing_meta = {
+            "version": 2,
+            "audio": audio_routing_meta,
+            "video": video_routing_meta,
+        }
 
     # 2–3. IDs + content hash
     content_id = str(uuid4())
