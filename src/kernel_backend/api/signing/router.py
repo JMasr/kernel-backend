@@ -71,14 +71,33 @@ async def sign(
             )
 
     suffix = Path(file.filename or "upload.aac").suffix or ".aac"
+
+    # Extension allowlist — reject unsupported formats early
+    from kernel_backend.core.services.format_validation import validate_media_extension
+    try:
+        validate_media_extension(file.filename or f"upload{suffix}")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(content)
         media_path = tmp.name
 
     # Pre-queue duration validation — reject too-short / too-long files immediately
+    normalized_path: str | None = None
     try:
         from kernel_backend.infrastructure.media.media_service import MediaService
-        profile = MediaService().probe(Path(media_path))
+        media_svc = MediaService()
+
+        # Normalize non-H.264 video to H.264 MP4 intermediate
+        norm_path, was_transcoded = media_svc.normalize_video_input(Path(media_path))
+        if was_transcoded:
+            normalized_path = str(norm_path)
+            # Clean up original upload, use transcoded file going forward
+            Path(media_path).unlink(missing_ok=True)
+            media_path = normalized_path
+
+        profile = media_svc.probe(Path(media_path))
         _MIN_VIDEO_DURATION = 85   # 17 segments × 5 s/segment
         _MIN_AUDIO_DURATION = 34   # 17 segments × 2 s/segment
         _MAX_DURATION = 3600       # 1 hour

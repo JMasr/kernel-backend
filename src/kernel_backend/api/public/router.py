@@ -85,14 +85,29 @@ async def verify_public(
     if len(content) > _MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large (max 2 GB)")
 
+    # Extension allowlist — reject unsupported formats early
+    from kernel_backend.core.services.format_validation import validate_media_extension
+    try:
+        validate_media_extension(file.filename or "upload.mp4")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
     suffix = Path(file.filename or "upload").suffix or ".mp4"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp_path = Path(tmp.name)
         tmp.write(content)
 
+    normalized_path: Path | None = None
     try:
         media = MediaService()
         service = VerificationService()
+
+        # Normalize non-H.264 video to H.264 MP4 intermediate
+        norm_path, was_transcoded = media.normalize_video_input(tmp_path)
+        if was_transcoded:
+            normalized_path = norm_path
+            tmp_path.unlink(missing_ok=True)
+            tmp_path = norm_path
 
         storage = request.app.state.storage
         registry = request.app.state.registry
@@ -141,6 +156,8 @@ async def verify_public(
 
     finally:
         tmp_path.unlink(missing_ok=True)
+        if normalized_path and normalized_path != tmp_path:
+            normalized_path.unlink(missing_ok=True)
 
     # Build base response from standard fields
     base = _to_response(result)
