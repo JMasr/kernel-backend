@@ -172,6 +172,9 @@ class TestSignOwnershipCheck:
         with patch(
             "kernel_backend.infrastructure.media.media_service.MediaService.probe",
             return_value=_VALID_AUDIO_PROFILE,
+        ), patch(
+            "kernel_backend.infrastructure.media.media_service.MediaService.normalize_video_input",
+            side_effect=lambda self, p: (p, False),
         ):
             with TestClient(app, raise_server_exceptions=False) as client:
                 response = client.post(
@@ -239,6 +242,9 @@ class TestSignOwnershipCheck:
         with patch(
             "kernel_backend.infrastructure.media.media_service.MediaService.probe",
             return_value=_VALID_AUDIO_PROFILE,
+        ), patch(
+            "kernel_backend.infrastructure.media.media_service.MediaService.normalize_video_input",
+            side_effect=lambda self, p: (p, False),
         ):
             with TestClient(app, raise_server_exceptions=False) as client:
                 response = client.post(

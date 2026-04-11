@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -71,6 +72,65 @@ class MediaService(MediaPort):
             audio_bitrate_bps=audio_bitrate_bps,
             video_bitrate_bps=video_bitrate_bps,
         )
+
+    def normalize_video_input(self, input_path: Path) -> tuple[Path, bool]:
+        """If the video isn't H.264/MP4, transcode to an intermediate H.264 MP4.
+
+        Returns (path_to_use, was_transcoded). Caller must clean up the temp
+        file when was_transcoded is True.
+
+        Audio-only files are returned unchanged (ffmpeg pipe handles any codec).
+        """
+        try:
+            info = ffmpeg.probe(str(input_path))
+        except ffmpeg.Error as e:
+            raise ValueError(
+                f"Cannot read media file: {e.stderr.decode()}"
+            ) from e
+
+        streams = info.get("streams", [])
+        video_stream = next(
+            (s for s in streams if s["codec_type"] == "video"), None
+        )
+
+        # Audio-only — no transcode needed
+        if video_stream is None:
+            return input_path, False
+
+        codec_name = video_stream.get("codec_name", "")
+        already_h264_mp4 = (
+            codec_name == "h264" and input_path.suffix.lower() == ".mp4"
+        )
+        if already_h264_mp4:
+            return input_path, False
+
+        # Transcode to H.264 MP4 intermediate
+        output = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        output_path = Path(output.name)
+        output.close()
+
+        try:
+            (
+                ffmpeg
+                .input(str(input_path))
+                .output(
+                    str(output_path),
+                    vcodec="libx264",
+                    acodec="aac",
+                    preset="ultrafast",
+                    crf=18,
+                    vsync="cfr",
+                )
+                .overwrite_output()
+                .run(capture_stderr=True)
+            )
+        except ffmpeg.Error as e:
+            output_path.unlink(missing_ok=True)
+            raise ValueError(
+                f"Transcode failed: {e.stderr.decode()}"
+            ) from e
+
+        return output_path, True
 
     def decode_audio_to_pcm(
         self,

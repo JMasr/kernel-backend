@@ -73,3 +73,23 @@ def test_video_hopping_deterministic(n: int, cid: str, pubkey: str) -> None:
     a = plan_video_hopping(n, cid, pubkey, PEPPER)
     b = plan_video_hopping(n, cid, pubkey, PEPPER)
     assert a == b
+
+
+def test_audio_hopping_target_subband_passthrough() -> None:
+    """target_subband parameter is passed through to all BandConfigs."""
+    configs = plan_audio_hopping(
+        10, CONTENT_ID, PUBKEY, PEPPER,
+        force_levels=[5],
+        target_subband="approximation",
+    )
+    assert len(configs) == 10
+    for cfg in configs:
+        assert cfg.target_subband == "approximation"
+        assert cfg.dwt_level == 5
+
+
+def test_audio_hopping_default_subband_is_detail() -> None:
+    """Default target_subband is 'detail' (backward compat)."""
+    configs = plan_audio_hopping(5, CONTENT_ID, PUBKEY, PEPPER)
+    for cfg in configs:
+        assert cfg.target_subband == "detail"

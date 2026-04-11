@@ -29,6 +29,17 @@ from kernel_backend.core.ports.media import MediaPort
 from kernel_backend.core.ports.registry import RegistryPort
 from kernel_backend.core.ports.storage import StoragePort
 from kernel_backend.core.services.crypto_service import derive_wid, sign_manifest
+from kernel_backend.core.domain.content_profile import routing_decision_to_dict
+from kernel_backend.engine.audio.algorithm_router import (
+    route as route_audio,
+    routing_decision_to_audio_params,
+)
+from kernel_backend.engine.audio.content_profiler import (
+    SUBSAMPLE_DURATION_S,
+    SUBSAMPLE_N_SEGMENTS,
+    SUBSAMPLE_THRESHOLD_S,
+    profile_audio,
+)
 from kernel_backend.engine.audio.fingerprint import (
     extract_hashes as extract_audio_hashes,
     extract_hashes_from_stream as extract_audio_hashes_from_stream,
@@ -222,6 +233,7 @@ async def _persist_payload(
         org_id=org_id,
         signed_media_key=payload["signed_media_key"],
         output_encoding_params=payload.get("output_encoding_params"),
+        routing_metadata=payload.get("routing_metadata"),
     ))
 
     if payload.get("audio_fingerprints"):
@@ -237,6 +249,36 @@ async def _persist_payload(
             for f in payload["video_fingerprints"]  # type: ignore[union-attr]
         ]
         await registry.save_segments(payload["content_id"], fp_list, is_original=True)
+
+
+# ── Content profiling helper ────────────────────────────────────────────────
+
+def _load_profiling_segments(media_path: Path, duration_s: float) -> list[np.ndarray]:
+    """Load audio segments for content profiling.
+
+    For files <= 10 min: load full audio at 22050 Hz.
+    For files > 10 min: load 3x30s segments (start, middle, end).
+    """
+    import librosa
+
+    profiling_sr = 22050
+    if duration_s <= SUBSAMPLE_THRESHOLD_S:
+        samples, _ = librosa.load(media_path, sr=profiling_sr, mono=True)
+        return [samples]
+
+    offsets = [
+        0.0,
+        max(0.0, duration_s / 2 - SUBSAMPLE_DURATION_S / 2),
+        max(0.0, duration_s - SUBSAMPLE_DURATION_S),
+    ]
+    segments = []
+    for offset in offsets:
+        seg, _ = librosa.load(
+            media_path, sr=profiling_sr, mono=True,
+            offset=offset, duration=SUBSAMPLE_DURATION_S,
+        )
+        segments.append(seg)
+    return segments
 
 
 # ── CPU phases ────────────────────────────────────────────────────────────────
@@ -256,11 +298,21 @@ def _sign_audio_cpu(
     audio_params: AudioEmbeddingParams | None = None,
 ) -> RawSigningPayload:
     """CPU phase of audio signing. Returns a serialisable RawSigningPayload."""
-    ap = audio_params or _DEFAULT_AUDIO_PARAMS
     # 1. Probe
     profile = media.probe(media_path)
     if profile.container_type == "video_only":
         raise ValueError("Container has no audio track — cannot sign audio-only pipeline")
+
+    # 1b. Content profiling + adaptive routing (unless caller supplied explicit params)
+    routing_meta: dict | None = None
+    if audio_params is not None:
+        ap = audio_params
+    else:
+        profiling_segments = _load_profiling_segments(media_path, profile.duration_s)
+        content_profile = profile_audio(np.concatenate(profiling_segments), 22050)
+        routing = route_audio(content_profile)
+        ap = routing_decision_to_audio_params(routing)
+        routing_meta = routing_decision_to_dict(routing)
 
     # 2–3. IDs and content hash
     content_id = str(uuid4())
@@ -320,6 +372,7 @@ def _sign_audio_cpu(
     band_configs = plan_audio_hopping(
         rs_n, content_id, certificate.public_key_pem, pepper,
         force_levels=list(ap.dwt_levels),
+        target_subband=ap.target_subband,
     )
     rs_symbols = ReedSolomonCodec(rs_n).encode(wid.data)
 
@@ -409,6 +462,7 @@ def _sign_audio_cpu(
                 "sample_rate": target_sample_rate,
             }
         },
+        routing_metadata=routing_meta,
     )
 
 
@@ -566,7 +620,6 @@ def _sign_av_cpu(
     output_crf: int | None = None,
 ) -> RawSigningPayload:
     """CPU phase of AV signing (single shared WID). Returns a serialisable RawSigningPayload."""
-    ap = audio_params or _DEFAULT_AV_AUDIO_PARAMS
     vp = video_params or _DEFAULT_VIDEO_PARAMS
     # 1. Probe — require both tracks
     profile = media.probe(media_path)
@@ -575,6 +628,33 @@ def _sign_av_cpu(
             "sign_av requires both audio and video tracks. "
             f"has_video={profile.has_video}, has_audio={profile.has_audio}"
         )
+
+    # 1b. Content profiling + adaptive routing for audio track
+    routing_meta: dict | None = None
+    if audio_params is not None:
+        ap = audio_params
+    else:
+        profiling_segments = _load_profiling_segments(media_path, profile.duration_s)
+        content_profile = profile_audio(np.concatenate(profiling_segments), 22050)
+        routing = route_audio(content_profile)
+        ap = routing_decision_to_audio_params(routing)
+        routing_meta = routing_decision_to_dict(routing)
+
+        # Silent audio track → delegate to video-only pipeline (audio WID
+        # cannot survive on a silent carrier, so embedding it only produces
+        # false-RED verdicts on verification).
+        if content_profile.content_type == "silence":
+            import logging
+            logging.getLogger(__name__).warning(
+                "Audio track classified as silence (conf=%.2f) — "
+                "falling back to video-only signing pipeline.",
+                content_profile.confidence,
+            )
+            return _sign_video_cpu(
+                media_path, certificate, private_key_pem, pepper, media,
+                org_id=org_id, original_filename=original_filename,
+                video_params=video_params, output_crf=output_crf,
+            )
 
     # 2–3. IDs + content hash
     content_id = str(uuid4())
@@ -639,6 +719,7 @@ def _sign_av_cpu(
     band_configs = plan_audio_hopping(
         rs_n, content_id, certificate.public_key_pem, pepper,
         force_levels=list(ap.dwt_levels),
+        target_subband=ap.target_subband,
     )
 
     # 13. Embed audio — streaming pass
@@ -786,6 +867,7 @@ def _sign_av_cpu(
             },
             "video": {"codec": "libx264", "crf": av_crf_to_use, "preset": "ultrafast"},
         },
+        routing_metadata=routing_meta,
     )
 
 
