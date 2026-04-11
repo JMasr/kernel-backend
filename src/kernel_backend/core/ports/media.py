@@ -128,6 +128,16 @@ class MediaPort(ABC):
         """
 
     @abstractmethod
+    def normalize_video_input(self, input_path: Path) -> tuple[Path, bool]:
+        """If the video isn't H.264/MP4, transcode to an intermediate H.264 MP4.
+
+        Returns (path_to_use, was_transcoded). Caller must clean up the temp
+        file when was_transcoded is True.
+
+        Audio-only files are returned unchanged (ffmpeg pipe handles any codec).
+        """
+
+    @abstractmethod
     def iter_video_segments(
         self,
         path: Path,

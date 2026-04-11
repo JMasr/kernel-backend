@@ -56,6 +56,8 @@ def _video_only_media_mock() -> MagicMock:
     profile.has_video = True
     profile.has_audio = False
     media.probe.return_value = profile
+    # normalize_video_input returns (original_path, False) — no transcode needed
+    media.normalize_video_input.side_effect = lambda p: (p, False)
     return media
 
 

@@ -64,3 +64,6 @@ class RawSigningPayload(TypedDict):
 
     # Codec/quality parameters used at sign time (for observability — not used by verifier)
     output_encoding_params: NotRequired[dict | None]
+
+    # Content-adaptive routing decision (None for legacy content)
+    routing_metadata: NotRequired[dict | None]

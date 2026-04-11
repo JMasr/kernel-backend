@@ -42,6 +42,13 @@ def _default_bc(i: int = 0) -> BandConfig:
     return BandConfig(segment_index=i, coeff_positions=[], dwt_level=2)
 
 
+def _approx_bc(i: int = 0, level: int = 5) -> BandConfig:
+    return BandConfig(
+        segment_index=i, coeff_positions=[], dwt_level=level,
+        target_subband="approximation",
+    )
+
+
 def test_embed_extract_roundtrip_correlation() -> None:
     """
     embed_segment → extract_segment → correlation > 0.3 on synthetic noise.
@@ -134,3 +141,53 @@ def test_wrong_seed_gives_low_correlation() -> None:
     assert mean_correct >= ERASURE_THRESHOLD_Z, (
         f"Correct-seed Z-score {mean_correct:.4f} < ERASURE_THRESHOLD_Z {ERASURE_THRESHOLD_Z}"
     )
+
+
+# ── Approximation band tests ────────────────────────────────────────────────
+
+def test_approx_band_embed_extract_roundtrip() -> None:
+    """Embed in approximation band at level 5, extract → Z-score above threshold."""
+    seg = _noise_segment(0)
+    bc = _approx_bc(0, level=5)
+    seed = _pn_seed(0)
+    embedded = embed_segment(seg, rs_symbol=0b10101010, band_config=bc,
+                              pn_seed=seed, target_snr_db=_TEST_SNR_DB)
+    corr = extract_segment(embedded, bc, seed)
+    assert corr > ERASURE_THRESHOLD_Z, (
+        f"Approx band Z-score {corr:.4f} too low (expected > {ERASURE_THRESHOLD_Z})"
+    )
+
+
+def test_approx_band_output_length_preserved() -> None:
+    """Approximation band embedding preserves signal length."""
+    seg = _noise_segment(0)
+    bc = _approx_bc(0, level=5)
+    embedded = embed_segment(seg, 0b11001100, bc, _pn_seed(0), target_snr_db=_TEST_SNR_DB)
+    assert len(embedded) == len(seg)
+
+
+def test_cross_subband_mismatch_low_z() -> None:
+    """Embedding in detail, extracting as approximation → near-zero Z-score."""
+    seg = _noise_segment(0)
+    seed = _pn_seed(0)
+
+    # Embed in detail band (default)
+    bc_detail = _default_bc(0)
+    embedded = embed_segment(seg, 0b10101010, bc_detail, seed, target_snr_db=_TEST_SNR_DB)
+
+    # Extract expecting approximation band → should find nothing
+    bc_approx = _approx_bc(0, level=2)
+    z_cross = extract_segment(embedded, bc_approx, seed)
+
+    # Extract with correct subband
+    z_correct = extract_segment(embedded, bc_detail, seed)
+
+    assert z_cross < z_correct, (
+        f"Cross-subband Z ({z_cross:.4f}) should be < correct Z ({z_correct:.4f})"
+    )
+
+
+def test_default_subband_is_detail() -> None:
+    """BandConfig without target_subband uses detail (backward compat)."""
+    bc = BandConfig(segment_index=0, coeff_positions=[], dwt_level=2)
+    assert bc.target_subband == "detail"
