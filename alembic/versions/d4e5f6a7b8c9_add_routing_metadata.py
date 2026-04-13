@@ -1,7 +1,7 @@
 """Add routing_metadata to videos
 
-Revision ID: c3d4e5f6a7b8
-Revises: b2c3d4e5f6a7
+Revision ID: d4e5f6a7b8c9
+Revises: c3d4e5f6a7b8
 Create Date: 2026-04-09
 
 """
@@ -10,8 +10,8 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision = "c3d4e5f6a7b8"
-down_revision = "b2c3d4e5f6a7"
+revision = "d4e5f6a7b8c9"
+down_revision = "c3d4e5f6a7b8"
 branch_labels = None
 depends_on = None
 
