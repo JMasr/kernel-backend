@@ -10,9 +10,9 @@ from pathlib import Path
 
 ACCEPTED_EXTENSIONS: frozenset[str] = frozenset({
     # Video
-    ".mp4", ".mov", ".avi", ".mkv", ".webm",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp", ".flv", ".wmv", ".mpg", ".mpeg",
     # Audio
-    ".wav", ".mp3", ".aac", ".m4a", ".flac", ".ogg", ".opus",
+    ".wav", ".mp3", ".aac", ".m4a", ".flac", ".ogg", ".opus", ".wma", ".aiff", ".au",
 })
 
 

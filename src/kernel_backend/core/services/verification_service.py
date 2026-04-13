@@ -31,7 +31,7 @@ from kernel_backend.core.domain.verification import (
 from kernel_backend.core.ports.media import MediaPort
 from kernel_backend.core.ports.registry import RegistryPort
 from kernel_backend.core.ports.storage import StoragePort
-from kernel_backend.core.domain.watermark import VideoEmbeddingParams
+from kernel_backend.core.domain.watermark import SegmentMap, VideoEmbeddingParams
 from kernel_backend.core.services.crypto_service import derive_wid, verify_manifest
 from kernel_backend.engine.audio.fingerprint import (
     extract_hashes as extract_audio_hashes,
@@ -362,6 +362,7 @@ class VerificationService:
             chips_per_bit=_ap.chips_per_bit,
             force_levels=list(_ap.dwt_levels),
             target_subband=_ap.target_subband,
+            segment_map=_ap.segment_map,
         )
 
         if not decodable:
@@ -485,6 +486,7 @@ class VerificationService:
             chips_per_bit=_ap_av.chips_per_bit,
             force_levels=list(_ap_av.dwt_levels),
             target_subband=_ap_av.target_subband,
+            segment_map=_ap_av.segment_map,
         )
 
         # Phase B — extract video WID
@@ -544,59 +546,78 @@ class VerificationService:
         chips_per_bit: int = 256,
         force_levels: list[int] | None = None,
         target_subband: str = "detail",
+        segment_map: SegmentMap | None = None,
     ) -> tuple[bytes | None, bool, int, int, int]:
         """
         Extract audio WID via DSSS correlation over each 2-second segment.
         Returns (decoded_wid, decodable, n_segments, n_decoded, n_erasures).
         decoded_wid is None and decodable is False when RS decode fails.
 
-        chips_per_bit, force_levels, and target_subband should be read from
-        entry.embedding_params.audio to reconstruct the exact pipeline used
-        at sign time.
+        chips_per_bit, force_levels, target_subband, and segment_map should be
+        read from entry.embedding_params.audio to reconstruct the exact pipeline
+        used at sign time. When segment_map is None (legacy content), falls back
+        to sequential 0..rs_n.
         """
         band_configs = plan_audio_hopping(
             rs_n, content_id, author_public_key, pepper,
             force_levels=force_levels,
             target_subband=target_subband,
         )
-        symbols: list[int | None] = []
+
+        # Build segment→RS index mapping
+        if segment_map is not None:
+            selected_set = set(segment_map.selected_indices)
+            seg_to_rs = {seg_idx: rs_idx
+                         for rs_idx, seg_idx in enumerate(segment_map.selected_indices)}
+            # We need to iterate up to the last selected segment
+            max_seg = max(selected_set) if selected_set else 0
+        else:
+            # Legacy: sequential 0..rs_n-1
+            selected_set = set(range(rs_n))
+            seg_to_rs = {i: i for i in range(rs_n)}
+            max_seg = rs_n - 1
+
+        symbols: list[int | None] = [None] * rs_n
         erasure_positions: list[int] = []
         n_segments_total = 0
+        n_extracted = 0
 
         for seg_idx, chunk, _ in media.iter_audio_segments(
             media_path, segment_duration_s=2.0, target_sample_rate=44100
         ):
-            if seg_idx >= rs_n:
+            if seg_idx > max_seg:
                 break
 
             n_segments_total += 1
+
+            if seg_idx not in selected_set:
+                continue
+
+            rs_idx = seg_to_rs[seg_idx]
             pn_seed = int.from_bytes(
                 hmac.new(
                     pepper,
-                    f"wid|{content_id}|{author_public_key}|{seg_idx}".encode(),
+                    f"wid|{content_id}|{author_public_key}|{rs_idx}".encode(),
                     hashlib.sha256,
                 ).digest()[:8],
                 "big",
             )
 
             symbol_byte, mean_z = extract_audio_symbol(
-                chunk, band_configs[seg_idx], pn_seed, chips_per_bit=chips_per_bit
+                chunk, band_configs[rs_idx], pn_seed, chips_per_bit=chips_per_bit
             )
 
             if mean_z < ERASURE_THRESHOLD_Z:
-                erasure_positions.append(seg_idx)
-                symbols.append(None)
+                symbols[rs_idx] = None
             else:
-                symbols.append(symbol_byte)
+                symbols[rs_idx] = symbol_byte
+                n_extracted += 1
 
-        # Pad trailing erasures: if the file is shorter than rs_n segments (e.g. trailing
-        # trim), the missing trailing segments are implicit erasures for RS decode.
-        for trailing_idx in range(n_segments_total, rs_n):
-            erasure_positions.append(trailing_idx)
-            symbols.append(None)
+        # Mark all None positions as erasures
+        erasure_positions = [i for i, s in enumerate(symbols) if s is None]
 
         n_erasures = len(erasure_positions)
-        n_decoded = n_segments_total - (n_erasures - (rs_n - n_segments_total))
+        n_decoded = rs_n - n_erasures
 
         codec = ReedSolomonCodec(rs_n)
         try:

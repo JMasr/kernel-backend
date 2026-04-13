@@ -124,13 +124,16 @@ class InMemoryRegistry(RegistryPort):
     ) -> list[VideoEntry]:
         from kernel_backend.engine.audio.fingerprint import hamming_distance
 
-        matches: set[str] = set()
+        matching_counts: dict[str, int] = {}
         for query_hash in hashes:
             for content_id, stored_fps in self._segments.items():
                 for sfp in stored_fps:
                     if hamming_distance(query_hash, sfp.hash_hex) <= max_hamming:
-                        matches.add(content_id)
-        return [self._videos[cid] for cid in matches if cid in self._videos]
+                        matching_counts[content_id] = matching_counts.get(content_id, 0) + 1
+                        break
+        
+        sorted_cids = sorted(matching_counts.keys(), key=lambda cid: matching_counts[cid], reverse=True)
+        return [self._videos[cid] for cid in sorted_cids if cid in self._videos]
 
 
 # ── Infrastructure bootstrap ───────────────────────────────────────────────────
