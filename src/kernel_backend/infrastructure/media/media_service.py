@@ -109,17 +109,28 @@ class MediaService(MediaPort):
         output_path = Path(output.name)
         output.close()
 
+        is_h264 = (codec_name == "h264")
+        vcodec = "copy" if is_h264 else "libx264"
+        
+        output_kwargs = {
+            "acodec": "aac",
+            "vcodec": vcodec,
+        }
+        
+        if not is_h264:
+            output_kwargs.update({
+                "preset": "ultrafast",
+                "crf": 18,
+                "vsync": "cfr"
+            })
+
         try:
             (
                 ffmpeg
                 .input(str(input_path))
                 .output(
                     str(output_path),
-                    vcodec="libx264",
-                    acodec="aac",
-                    preset="ultrafast",
-                    crf=18,
-                    vsync="cfr",
+                    **output_kwargs
                 )
                 .overwrite_output()
                 .run(capture_stderr=True)
