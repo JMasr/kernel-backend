@@ -334,8 +334,20 @@ async def test_stored_params_match_defaults(synthetic_audio_120s: Path) -> None:
 
     entry = registry._videos[result.content_id]
     # Audio-only signing stores video=None (only audio params are relevant)
-    expected = EmbeddingParams(audio=DEFAULT_AUDIO_PARAMS, video=None)
-    assert entry.embedding_params == expected
+    # segment_map is populated at sign time (content-adaptive placement),
+    # so compare DSP-relevant fields, not the segment_map itself.
+    stored_ap = entry.embedding_params.audio
+    assert stored_ap is not None
+    assert stored_ap.dwt_levels == DEFAULT_AUDIO_PARAMS.dwt_levels
+    assert stored_ap.chips_per_bit == DEFAULT_AUDIO_PARAMS.chips_per_bit
+    assert stored_ap.psychoacoustic == DEFAULT_AUDIO_PARAMS.psychoacoustic
+    assert stored_ap.safety_margin_db == DEFAULT_AUDIO_PARAMS.safety_margin_db
+    assert stored_ap.target_snr_db == DEFAULT_AUDIO_PARAMS.target_snr_db
+    assert stored_ap.target_subband == DEFAULT_AUDIO_PARAMS.target_subband
+    assert entry.embedding_params.video is None
+    # segment_map must be present after signing
+    assert stored_ap.segment_map is not None
+    assert len(stored_ap.segment_map.selected_indices) > 0
 
 
 @pytest.mark.slow
@@ -354,7 +366,7 @@ async def test_no_pilot_in_active_signals(synthetic_audio_120s: Path) -> None:
         media=MediaService(),
     )
 
-    assert set(result.active_signals) == {"wid_audio", "fingerprint_audio"}
+    assert set(result.active_signals) == {"audio_wid", "audio_fingerprint"}
     assert "pilot_audio" not in result.active_signals
 
 

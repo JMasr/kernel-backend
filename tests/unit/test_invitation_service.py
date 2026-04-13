@@ -49,6 +49,7 @@ def _mock_inv_repo(**overrides) -> MagicMock:
     repo = MagicMock()
     repo.create = AsyncMock()
     repo.get_by_token = AsyncMock()
+    repo.get_pending_by_email_and_org = AsyncMock(return_value=None)
     repo.update = AsyncMock()
     repo.list = AsyncMock(return_value=[])
     repo.count = AsyncMock(return_value=0)

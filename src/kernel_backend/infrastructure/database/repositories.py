@@ -263,15 +263,17 @@ class VideoRepository:
         result = await self._session.execute(stmt)
         all_fp = result.scalars().all()
 
-        matching_content_ids: set[str] = set()
+        matching_counts: dict[str, int] = {}
         for fp in all_fp:
             for qh in hashes:
                 if _hamming(fp.hash_hex, qh) <= max_hamming:
-                    matching_content_ids.add(fp.content_id)
+                    matching_counts[fp.content_id] = matching_counts.get(fp.content_id, 0) + 1
                     break
 
         entries: list[VideoEntry] = []
-        for cid in matching_content_ids:
+        # Sort content_ids by match count descending
+        sorted_cids = sorted(matching_counts.keys(), key=lambda cid: matching_counts[cid], reverse=True)
+        for cid in sorted_cids:
             entry = await self.get_by_content_id(cid)
             if entry is not None:
                 entries.append(entry)
