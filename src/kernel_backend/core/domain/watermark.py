@@ -5,6 +5,18 @@ from uuid import UUID
 
 
 @dataclass(frozen=True)
+class SegmentMap:
+    """Maps RS symbol index → audio segment index for non-sequential embedding.
+
+    selected_indices[rs_idx] = audio_segment_idx.
+    When present, embedding/extraction skip unselected segments.
+    When absent (None on AudioEmbeddingParams), legacy sequential 0..rs_n is used.
+    """
+    selected_indices: tuple[int, ...]  # selected_indices[rs_idx] = segment_idx
+    total_segments: int                # total segments in the file
+
+
+@dataclass(frozen=True)
 class AudioEmbeddingParams:
     dwt_levels: tuple[int, ...]   # active DWT levels, e.g. (1, 2)
     chips_per_bit: int             # chips per bit in DSSS
@@ -15,6 +27,7 @@ class AudioEmbeddingParams:
     target_subband: str = "detail"       # "detail" | "approximation"
     frame_length_ms: float = 0.0         # 0.0 = legacy 2s segments
     pn_sequence_length: int = 0          # 0 = derive from chips_per_bit * 8
+    segment_map: SegmentMap | None = None  # None = legacy sequential embedding
 
 
 @dataclass(frozen=True)
@@ -36,8 +49,19 @@ class EmbeddingParams:
 
 def embedding_params_to_dict(p: EmbeddingParams) -> dict:
     """Serialize EmbeddingParams to a flat dict suitable for JSONB storage."""
+    audio_dict = None
+    if p.audio:
+        audio_dict = asdict(p.audio)
+        # SegmentMap is stored as a plain dict; None → omit key entirely
+        if p.audio.segment_map is not None:
+            audio_dict["segment_map"] = {
+                "selected_indices": list(p.audio.segment_map.selected_indices),
+                "total_segments": p.audio.segment_map.total_segments,
+            }
+        else:
+            audio_dict.pop("segment_map", None)
     return {
-        "audio": asdict(p.audio) if p.audio else None,
+        "audio": audio_dict,
         "video": asdict(p.video) if p.video else None,
     }
 
@@ -53,6 +77,15 @@ def embedding_params_from_dict(d: dict) -> EmbeddingParams:
         audio_data.setdefault("target_subband", "detail")
         audio_data.setdefault("frame_length_ms", 0.0)
         audio_data.setdefault("pn_sequence_length", 0)
+        # Deserialize segment_map if present (None for legacy content)
+        sm_raw = audio_data.pop("segment_map", None)
+        if sm_raw is not None and isinstance(sm_raw, dict):
+            audio_data["segment_map"] = SegmentMap(
+                selected_indices=tuple(sm_raw["selected_indices"]),
+                total_segments=sm_raw["total_segments"],
+            )
+        else:
+            audio_data["segment_map"] = None
         audio_obj = AudioEmbeddingParams(**audio_data)
     video_obj = None
     if d.get("video"):

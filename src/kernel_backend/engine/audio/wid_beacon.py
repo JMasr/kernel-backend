@@ -137,7 +137,7 @@ def embed_segment(
                 silence_gate=sg, temporal_mask=tm,
                 energy_floor=0.15,
             )
-            for rep in range(tile_count):
+            for rep in range(tile_count + 1):
                 start = rep * n_chips
                 end = start + n_chips
                 if end <= len(band):
@@ -147,7 +147,7 @@ def embed_segment(
                     if remainder > 0:
                         band[start:] += chips[:remainder] * amplitude * gain[start:]
         else:
-            for rep in range(tile_count):
+            for rep in range(tile_count + 1):
                 start = rep * n_chips
                 end = start + n_chips
                 if end <= len(band):

@@ -191,3 +191,125 @@ def test_default_subband_is_detail() -> None:
     """BandConfig without target_subband uses detail (backward compat)."""
     bc = BandConfig(segment_index=0, coeff_positions=[], dwt_level=2)
     assert bc.target_subband == "detail"
+
+
+# ── Segment map tests ───────────────────────────────────────────────────────
+
+from kernel_backend.core.domain.watermark import (
+    AudioEmbeddingParams,
+    EmbeddingParams,
+    SegmentMap,
+    embedding_params_to_dict,
+    embedding_params_from_dict,
+)
+from kernel_backend.engine.audio.wid_beacon import (
+    extract_symbol_segment,
+)
+
+
+def test_segment_map_roundtrip() -> None:
+    """Embed with segment map → extract with same map → RS decode succeeds."""
+    wid = b'\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10'
+    n_total_segments = 40
+    # Select every other segment: [0, 2, 4, ..., 30] = 16 segments ...
+    # Actually we need rs_n >= 17, so select 32 of 40
+    n_segments = 32
+    # Select segments 4..35 (skip first 4 silent ones)
+    selected = list(range(4, 4 + n_segments))
+    segment_map = SegmentMap(
+        selected_indices=tuple(selected),
+        total_segments=n_total_segments,
+    )
+    seg_to_rs = {seg_idx: rs_idx for rs_idx, seg_idx in enumerate(selected)}
+
+    codec = ReedSolomonCodec(n_symbols=n_segments)
+    rs_symbols = codec.encode(wid)
+    band_configs = plan_audio_hopping(n_segments, CONTENT_ID, PUBKEY, PEPPER)
+    chips_per_bit = 32
+
+    # Embed: only into selected segments, keyed by RS index
+    embedded_segs: dict[int, np.ndarray] = {}
+    for seg_idx in range(n_total_segments):
+        seg = _noise_segment(seg_idx)
+        if seg_idx in seg_to_rs:
+            rs_idx = seg_to_rs[seg_idx]
+            seed = _pn_seed(rs_idx)
+            emb = embed_segment(seg, rs_symbols[rs_idx], band_configs[rs_idx],
+                                seed, chips_per_bit, target_snr_db=_TEST_SNR_DB)
+            embedded_segs[seg_idx] = emb
+        else:
+            embedded_segs[seg_idx] = seg
+
+    # Extract: using segment map
+    recovered_symbols: list[int | None] = [None] * n_segments
+    for seg_idx in selected:
+        rs_idx = seg_to_rs[seg_idx]
+        seed = _pn_seed(rs_idx)
+        symbol, mean_z = extract_symbol_segment(
+            embedded_segs[seg_idx], band_configs[rs_idx], seed,
+            chips_per_bit=chips_per_bit,
+        )
+        if mean_z >= 1.0:
+            recovered_symbols[rs_idx] = symbol
+
+    decoded = codec.decode(recovered_symbols)
+    assert decoded == wid, f"WID mismatch: {decoded.hex()} != {wid.hex()}"
+
+
+def test_segment_map_skips_silence() -> None:
+    """Create signal with silent segments at start, verify embedding avoids them."""
+    from kernel_backend.engine.audio.segment_scorer import score_segments, select_best
+
+    n_total = 20
+    segments = []
+    for i in range(n_total):
+        if i < 3:
+            # Silent segments
+            segments.append((i, np.zeros(SEG_LEN, dtype=np.float32)))
+        else:
+            segments.append((i, _noise_segment(i)))
+
+    scores = score_segments(iter(segments))
+    selected = select_best(scores, n_needed=17)
+
+    # None of the first 3 (silent) segments should be selected
+    for idx in selected:
+        assert idx >= 3, f"Silent segment {idx} was selected"
+
+
+def test_segment_map_serialization_roundtrip() -> None:
+    """SegmentMap survives embedding_params serialization → deserialization."""
+    sm = SegmentMap(selected_indices=(3, 5, 7, 10), total_segments=20)
+    ap = AudioEmbeddingParams(
+        dwt_levels=(2,),
+        chips_per_bit=32,
+        psychoacoustic=False,
+        safety_margin_db=12.0,
+        target_snr_db=-20.0,
+        segment_map=sm,
+    )
+    ep = EmbeddingParams(audio=ap, video=None)
+    d = embedding_params_to_dict(ep)
+    ep2 = embedding_params_from_dict(d)
+
+    assert ep2.audio is not None
+    assert ep2.audio.segment_map is not None
+    assert ep2.audio.segment_map.selected_indices == (3, 5, 7, 10)
+    assert ep2.audio.segment_map.total_segments == 20
+
+
+def test_segment_map_none_backward_compat() -> None:
+    """Legacy content without segment_map deserializes to None."""
+    d = {
+        "audio": {
+            "dwt_levels": [2],
+            "chips_per_bit": 32,
+            "psychoacoustic": False,
+            "safety_margin_db": 12.0,
+            "target_snr_db": -20.0,
+        },
+        "video": None,
+    }
+    ep = embedding_params_from_dict(d)
+    assert ep.audio is not None
+    assert ep.audio.segment_map is None
