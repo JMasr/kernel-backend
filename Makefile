@@ -95,11 +95,11 @@ typecheck:
 # ── Database ─────────────────────────────────────────────────────────────────
 .PHONY: migrate
 migrate:
-	alembic upgrade head
+	uv run alembic upgrade head
 
 .PHONY: migrate-create
 migrate-create:
-	@read -p "Migration name: " name; alembic revision --autogenerate -m "$$name"
+	@read -p "Migration name: " name; uv run alembic revision --autogenerate -m "$$name"
 
 .PHONY: reset-db
 reset-db:
