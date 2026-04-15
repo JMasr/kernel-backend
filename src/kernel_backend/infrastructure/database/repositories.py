@@ -128,6 +128,34 @@ def _hamming(a: str, b: str) -> int:
     return bin(int(a, 16) ^ int(b, 16)).count("1")
 
 
+def _hash_prefix(hash_hex: str) -> int:
+    """Top 16 bits of a 64-bit hex hash — keep in sync with the DB column."""
+    return int(hash_hex, 16) >> 48
+
+
+# Prefix Hamming radius used to prefilter candidates.  With a 16-bit prefix and
+# max full-hash Hamming of 10, per-segment recall at radius 1 is ~22%; content
+# recall stays effectively 100% because each content has many stored segments
+# so the OR across segments nearly always lands at least one hit.  Raising this
+# above 1 makes the prefilter set grow too large to prune effectively at typical
+# query sizes (hundreds of hashes).
+_PREFIX_RADIUS = 1
+
+
+def _prefixes_within_radius(prefix: int, radius: int = _PREFIX_RADIUS, bits: int = 16) -> list[int]:
+    """All 16-bit values within ``radius`` bit-flips of ``prefix``."""
+    from itertools import combinations
+
+    result = {prefix}
+    for r in range(1, radius + 1):
+        for combo in combinations(range(bits), r):
+            mask = 0
+            for i in combo:
+                mask |= 1 << i
+            result.add(prefix ^ mask)
+    return list(result)
+
+
 def _video_row_to_entry(row: Video) -> VideoEntry:
     ep = (
         embedding_params_from_dict(row.embedding_params)
@@ -236,6 +264,7 @@ class VideoRepository:
                 content_id=content_id,
                 time_offset_ms=seg.time_offset_ms,
                 hash_hex=seg.hash_hex,
+                hash_prefix=_hash_prefix(seg.hash_hex),
                 is_original=is_original,
             ))
         await self._session.commit()
@@ -246,38 +275,112 @@ class VideoRepository:
         max_hamming: int = 10,
         org_id: UUID | None = None,
     ) -> list[VideoEntry]:
-        """Iterate all stored fingerprints and compute hamming distance in Python.
+        """Return candidate VideoEntries whose fingerprints match any query hash.
 
-        When org_id is provided, only fingerprints belonging to that organization
-        are considered (multi-tenant isolation).
+        Prefilters at the DB layer on ``hash_prefix`` (top 16 bits, indexed) —
+        rows whose prefix Hamming distance exceeds the query-prefix radius
+        cannot be within ``max_hamming`` of any query hash, so they can be
+        pruned server-side before the full Hamming check runs in Python on
+        the narrow shortlist.
         """
+        if not hashes:
+            return []
+
+        candidate_prefixes: set[int] = set()
+        for qh in hashes:
+            candidate_prefixes.update(_prefixes_within_radius(_hash_prefix(qh)))
+
+        stmt = (
+            select(AudioFingerprint.content_id, AudioFingerprint.hash_hex)
+            .where(AudioFingerprint.hash_prefix.in_(candidate_prefixes))
+        )
         if org_id is not None:
-            stmt = (
-                select(AudioFingerprint)
-                .join(Video, AudioFingerprint.content_id == Video.content_id)
-                .where(Video.org_id == org_id)
+            stmt = stmt.join(Video, AudioFingerprint.content_id == Video.content_id).where(
+                Video.org_id == org_id
             )
-        else:
-            stmt = select(AudioFingerprint)
 
         result = await self._session.execute(stmt)
-        all_fp = result.scalars().all()
+        rows = result.all()
 
         matching_counts: dict[str, int] = {}
-        for fp in all_fp:
+        for content_id, hash_hex in rows:
             for qh in hashes:
-                if _hamming(fp.hash_hex, qh) <= max_hamming:
-                    matching_counts[fp.content_id] = matching_counts.get(fp.content_id, 0) + 1
+                if _hamming(hash_hex, qh) <= max_hamming:
+                    matching_counts[content_id] = matching_counts.get(content_id, 0) + 1
                     break
 
         entries: list[VideoEntry] = []
-        # Sort content_ids by match count descending
         sorted_cids = sorted(matching_counts.keys(), key=lambda cid: matching_counts[cid], reverse=True)
         for cid in sorted_cids:
             entry = await self.get_by_content_id(cid)
             if entry is not None:
                 entries.append(entry)
         return entries
+
+    async def match_fingerprints_batch(
+        self,
+        hashes_per_pepper: list[list[str]],
+        max_hamming: int = 10,
+        org_id: UUID | None = None,
+    ) -> list[list[VideoEntry]]:
+        """Batched variant: one prefix-union query covers all peppers.
+
+        The per-pepper fingerprints differ (each pepper seeds its own projection
+        matrix), so the shortlist is the union of candidate prefixes across
+        every pepper. Each pepper still computes its own Hamming-based verdict
+        against that shared shortlist, which keeps results bit-identical to
+        looping ``match_fingerprints`` per pepper while eliminating N−1 DB
+        roundtrips on the public verification path.
+        """
+        if not hashes_per_pepper:
+            return []
+        if not any(hashes_per_pepper):
+            return [[] for _ in hashes_per_pepper]
+
+        candidate_prefixes: set[int] = set()
+        for hashes in hashes_per_pepper:
+            for qh in hashes:
+                candidate_prefixes.update(_prefixes_within_radius(_hash_prefix(qh)))
+
+        if not candidate_prefixes:
+            return [[] for _ in hashes_per_pepper]
+
+        stmt = (
+            select(AudioFingerprint.content_id, AudioFingerprint.hash_hex)
+            .where(AudioFingerprint.hash_prefix.in_(candidate_prefixes))
+        )
+        if org_id is not None:
+            stmt = stmt.join(Video, AudioFingerprint.content_id == Video.content_id).where(
+                Video.org_id == org_id
+            )
+        result = await self._session.execute(stmt)
+        rows = result.all()
+
+        # Resolve each distinct content_id once; reuse entries across peppers.
+        entry_cache: dict[str, VideoEntry | None] = {}
+
+        per_pepper_entries: list[list[VideoEntry]] = []
+        for hashes in hashes_per_pepper:
+            matching_counts: dict[str, int] = {}
+            for content_id, hash_hex in rows:
+                for qh in hashes:
+                    if _hamming(hash_hex, qh) <= max_hamming:
+                        matching_counts[content_id] = matching_counts.get(content_id, 0) + 1
+                        break
+
+            entries: list[VideoEntry] = []
+            sorted_cids = sorted(
+                matching_counts.keys(), key=lambda cid: matching_counts[cid], reverse=True
+            )
+            for cid in sorted_cids:
+                if cid not in entry_cache:
+                    entry_cache[cid] = await self.get_by_content_id(cid)
+                entry = entry_cache[cid]
+                if entry is not None:
+                    entries.append(entry)
+            per_pepper_entries.append(entries)
+
+        return per_pepper_entries
 
     async def list_by_org_id(
         self,
@@ -395,3 +498,14 @@ class SessionFactoryRegistry(RegistryPort):
     ) -> list[VideoEntry]:
         async with self._factory() as session:  # type: ignore[operator]
             return await VideoRepository(session).match_fingerprints(hashes, max_hamming, org_id)
+
+    async def match_fingerprints_batch(
+        self,
+        hashes_per_pepper: list[list[str]],
+        max_hamming: int = 10,
+        org_id: UUID | None = None,
+    ) -> list[list[VideoEntry]]:
+        async with self._factory() as session:  # type: ignore[operator]
+            return await VideoRepository(session).match_fingerprints_batch(
+                hashes_per_pepper, max_hamming, org_id
+            )

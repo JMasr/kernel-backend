@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 from dataclasses import dataclass
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -86,6 +87,67 @@ def embed_segment(
     return result
 
 
+def _embed_ycrcb_inplace(
+    ycrcb: np.ndarray,
+    symbol_bits: np.ndarray,
+    content_id: str,
+    author_public_key: str,
+    segment_idx: int,
+    pepper: bytes,
+    use_jnd_adaptive: bool = False,
+    jnd_params: VideoEmbeddingParams | None = None,
+) -> None:
+    """Modify the Y channel of a uint8 YCrCb frame in place. Core DCT/QIM loop."""
+    coeffs_list = _coeff_set(content_id, author_public_key, segment_idx, pepper)
+    h, w = ycrcb.shape[:2]
+
+    oversample = jnd_params.block_oversample if jnd_params else 1
+    min_var = jnd_params.min_block_variance if jnd_params else 0.0
+
+    candidates = _select_blocks(
+        h, w, content_id, author_public_key, segment_idx, pepper,
+        oversample=oversample,
+    )
+    if not candidates:
+        return
+
+    y_float = ycrcb[:, :, 0].astype(np.float32)
+
+    if use_jnd_adaptive and jnd_params is not None:
+        step_base = jnd_params.qim_step_base
+        step_min = jnd_params.qim_step_min
+        step_max = jnd_params.qim_step_max
+        quantize_to = jnd_params.qim_quantize_to
+    else:
+        step_base = step_min = step_max = QIM_STEP_WID
+        quantize_to = 1.0
+
+    for cand_idx, (y0, x0) in enumerate(candidates):
+        if y0 + BLOCK_SIZE > h or x0 + BLOCK_SIZE > w:
+            continue
+
+        block = y_float[y0:y0 + BLOCK_SIZE, x0:x0 + BLOCK_SIZE].copy()
+
+        if min_var > 0 and float(np.var(block)) < min_var:
+            continue
+
+        if use_jnd_adaptive:
+            block_mean = float(np.mean(block))
+            step = _compute_adaptive_step(
+                block_mean, step_base, step_min, step_max, quantize_to
+            )
+        else:
+            step = QIM_STEP_WID
+
+        dct_block = cv2.dct(block)
+        bit = int(symbol_bits[cand_idx % 8])
+        for cr, cc in coeffs_list:
+            dct_block[cr, cc] = _qim_embed(dct_block[cr, cc], bit, step)
+        y_float[y0:y0 + BLOCK_SIZE, x0:x0 + BLOCK_SIZE] = cv2.idct(dct_block)
+
+    ycrcb[:, :, 0] = np.clip(y_float, 0, 255).astype(np.uint8)
+
+
 def embed_video_frame(
     frame: np.ndarray,
     symbol_bits: np.ndarray,
@@ -104,70 +166,68 @@ def embed_video_frame(
     from the unmodified block before any coefficient change, ensuring
     the extractor can reproduce the same step from the received frame.
     """
-    coeffs_list = _coeff_set(content_id, author_public_key, segment_idx, pepper)
-    h, w = frame.shape[:2]
-
-    # Extract block-selection params (default = no filtering)
-    oversample = jnd_params.block_oversample if jnd_params else 1
-    min_var = jnd_params.min_block_variance if jnd_params else 0.0
-
-    candidates = _select_blocks(
-        h, w, content_id, author_public_key, segment_idx, pepper,
-        oversample=oversample,
-    )
-    if not candidates:
-        return frame.copy()
-
     ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
-    y_float = ycrcb[:, :, 0].astype(np.float32)
-
-    # Unpack JND params if adaptive
-    if use_jnd_adaptive and jnd_params is not None:
-        step_base = jnd_params.qim_step_base
-        step_min = jnd_params.qim_step_min
-        step_max = jnd_params.qim_step_max
-        quantize_to = jnd_params.qim_quantize_to
-    else:
-        step_base = step_min = step_max = QIM_STEP_WID
-        quantize_to = 1.0
-
-    # Iterate over ALL candidates; use cand_idx for bit mapping so that
-    # embed and extract stay aligned even when variance filtering excludes
-    # slightly different blocks after H.264 (candidate index is stable).
-    for cand_idx, (y0, x0) in enumerate(candidates):
-        if y0 + BLOCK_SIZE > h or x0 + BLOCK_SIZE > w:
-            continue
-
-        block = y_float[y0:y0 + BLOCK_SIZE, x0:x0 + BLOCK_SIZE].copy()
-
-        # Skip low-variance blocks inline (energy-adaptive selection)
-        if min_var > 0 and float(np.var(block)) < min_var:
-            continue
-
-        # Compute adaptive step BEFORE modifying the block
-        if use_jnd_adaptive:
-            block_mean = float(np.mean(block))
-            step = _compute_adaptive_step(
-                block_mean, step_base, step_min, step_max, quantize_to
-            )
-        else:
-            step = QIM_STEP_WID
-
-        dct_block = cv2.dct(block)
-        bit = int(symbol_bits[cand_idx % 8])
-        for cr, cc in coeffs_list:
-            dct_block[cr, cc] = _qim_embed(dct_block[cr, cc], bit, step)
-        y_float[y0:y0 + BLOCK_SIZE, x0:x0 + BLOCK_SIZE] = cv2.idct(dct_block)
-
-    ycrcb[:, :, 0] = np.clip(y_float, 0, 255).astype(np.uint8)
+    _embed_ycrcb_inplace(
+        ycrcb, symbol_bits, content_id, author_public_key,
+        segment_idx, pepper, use_jnd_adaptive, jnd_params,
+    )
     return cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+
+
+def embed_video_frame_yuvj420_planes(
+    frame: np.ndarray,
+    symbol_bits: np.ndarray,
+    content_id: str,
+    author_public_key: str,
+    segment_idx: int,
+    pepper: bytes,
+    use_jnd_adaptive: bool = False,
+    jnd_params: VideoEmbeddingParams | None = None,
+) -> tuple[bytes, bytes, bytes]:
+    """
+    Fused embed + YUV420 plane extraction for the signing encoder pipe.
+
+    Equivalent to `embed_video_frame` followed by BGR→yuvj420p conversion,
+    but drops the YCrCb→BGR→YUV round-trip. One cvtColor per frame instead
+    of three. Full-range YCrCb planes match ffmpeg's yuvj420p pipe.
+
+    Returns (Y, U, V) as bytes — caller writes each to the ffmpeg stdin.
+    """
+    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+    _embed_ycrcb_inplace(
+        ycrcb, symbol_bits, content_id, author_public_key,
+        segment_idx, pepper, use_jnd_adaptive, jnd_params,
+    )
+    return (
+        ycrcb[:, :, 0].tobytes(),
+        ycrcb[::2, ::2, 2].tobytes(),  # U = Cb
+        ycrcb[::2, ::2, 1].tobytes(),  # V = Cr
+    )
+
+
+def frame_to_yuvj420_planes(frame: np.ndarray) -> tuple[bytes, bytes, bytes]:
+    """
+    BGR frame → (Y, U, V) bytes for an ffmpeg yuvj420p pipe.
+
+    Full-range YCrCb (matches yuvj420p) via a single cv2 color conversion,
+    then plane subsampling in numpy. Use this for frames that don't need
+    watermark embedding — companion to `embed_video_frame_yuvj420_planes`.
+    """
+    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+    return (
+        ycrcb[:, :, 0].tobytes(),
+        ycrcb[::2, ::2, 2].tobytes(),
+        ycrcb[::2, ::2, 1].tobytes(),
+    )
 
 
 def frame_to_yuv420(frame: np.ndarray) -> bytes:
     """
-    Convert a BGR frame to YUV I420 planar bytes for FFmpeg pipe input.
-    Used by the streaming video encoder in signing_service.py — keeps cv2
-    out of core/ (hexagonal boundary).
+    [Deprecated] BGR → YUV I420 bytes via cv2.COLOR_BGR2YUV_I420.
+
+    Retained for callers outside the signing hot loop. Produces BT.601
+    limited-range Y (16-235), which mismatches ffmpeg's yuvj420p full-range
+    pipe — prefer `frame_to_yuvj420_planes` for new code.
     """
     yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV_I420)
     return yuv.tobytes()
@@ -270,15 +330,20 @@ def extract_segment(
     )
 
 
+@lru_cache(maxsize=512)
 def _coeff_set(
     content_id: str,
     author_public_key: str,
     segment_idx: int,
     pepper: bytes,
-) -> list[tuple[int, int]]:
+) -> tuple[tuple[int, int], ...]:
     """
     Returns coefficient list for this segment.
     Always includes MANDATORY_COEFFS. May include 0, 1, or 2 OPTIONAL_COEFFS.
+
+    Cached per (content_id, pubkey, segment_idx, pepper): when the embed /
+    extract loops call this once per frame, the LRU cache collapses those
+    calls back to one HMAC+RNG per segment.
     """
     msg = f"wid_coeff|{content_id}|{author_public_key}|{segment_idx}".encode()
     digest = hmac.new(pepper, msg, hashlib.sha256).digest()
@@ -290,9 +355,10 @@ def _coeff_set(
         indices = rng.choice(len(OPTIONAL_COEFFS), size=min(n_extra, len(OPTIONAL_COEFFS)), replace=False)
         for idx in indices:
             result.append(OPTIONAL_COEFFS[int(idx)])
-    return result
+    return tuple(result)
 
 
+@lru_cache(maxsize=512)
 def _select_blocks(
     height: int,
     width: int,
@@ -302,13 +368,18 @@ def _select_blocks(
     pepper: bytes,
     n_blocks: int = N_WID_BLOCKS_PER_SEGMENT,
     oversample: int = 1,
-) -> list[tuple[int, int]]:
+) -> tuple[tuple[int, int], ...]:
     """
     Deterministic block selection (normalized coordinates → pixel coords).
     Same normalization invariant as pilot_tone._select_blocks.
 
     When oversample > 1, generates n_blocks * oversample candidates.
     Caller is responsible for filtering down to n_blocks.
+
+    Cached: the block set is a pure function of (h, w, content_id, pubkey,
+    segment_idx, pepper, n_blocks, oversample).  Within a signing job the
+    same segment's blocks are re-requested once per frame — the LRU cache
+    turns that into one RNG per segment instead of one per frame.
     """
     n_rows = height // BLOCK_SIZE
     n_cols = width // BLOCK_SIZE
@@ -316,7 +387,7 @@ def _select_blocks(
 
     n_candidates = min(n_blocks * oversample, total)
     if n_candidates == 0:
-        return []
+        return ()
 
     msg = f"wid_blocks|{content_id}|{author_public_key}|{segment_idx}".encode()
     digest = hmac.new(pepper, msg, hashlib.sha256).digest()
@@ -329,7 +400,7 @@ def _select_blocks(
         row = min(int(ny * n_rows), n_rows - 1)
         col = min(int(nx * n_cols), n_cols - 1)
         result.append((row * BLOCK_SIZE, col * BLOCK_SIZE))
-    return result
+    return tuple(result)
 
 
 _MIN_USABLE_BLOCKS = 16

@@ -37,3 +37,20 @@ class RegistryPort(ABC):
         belonging to that organization are considered (multi-tenant isolation).
         """
         ...
+
+    async def match_fingerprints_batch(
+        self,
+        hashes_per_pepper: list[list[str]],
+        max_hamming: int = 10,
+        org_id: UUID | None = None,
+    ) -> list[list[VideoEntry]]:
+        """Match many hash lists (one per pepper) with shared DB work.
+
+        Default implementation falls back to per-pepper `match_fingerprints`.
+        Adapters that can share a single prefix query across peppers should
+        override this method for the public multi-pepper verification path.
+        """
+        return [
+            await self.match_fingerprints(hashes, max_hamming=max_hamming, org_id=org_id)
+            for hashes in hashes_per_pepper
+        ]
