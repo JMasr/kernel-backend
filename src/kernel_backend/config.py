@@ -39,6 +39,15 @@ class Settings(BaseSettings):
     SIGN_POOL_MAX_WORKERS: int = 2
     SIGN_POOL_MAX_TASKS_PER_CHILD: int = 50
 
+    # Chunked parallel video signing. CHUNK_WORKERS subprocesses are spawned
+    # inside each sign job; effective CPU pressure is
+    # ARQ_MAX_JOBS * SIGN_POOL_MAX_WORKERS * CHUNK_WORKERS. Videos with fewer
+    # than CHUNK_MIN_PAYLOAD_SEGMENTS 5-second segments fall back to the
+    # sequential pipeline.
+    CHUNK_WORKERS: int = 4
+    CHUNK_GUARD_SEGMENTS: int = 1
+    CHUNK_MIN_PAYLOAD_SEGMENTS: int = 4
+
     @model_validator(mode="after")
     def _enforce_production_secrets(self) -> "Settings":
         if self.ENV == "production" and self.STORAGE_HMAC_SECRET == _HMAC_SECRET_PLACEHOLDER:
