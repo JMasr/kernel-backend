@@ -53,15 +53,17 @@ def _sign_sync(
     )
     media = MediaService()
     media_path_obj = Path(media_path)
+    # Single probe — passed through to the CPU helper so it does not respawn
+    # ffprobe on the same file.
     profile = media.probe(media_path_obj)
     parsed_org_id: UUID | None = UUID(org_id) if org_id else None
 
     if profile.has_video and profile.has_audio:
-        return _sign_av_cpu(media_path_obj, certificate, private_key_pem, pepper, media, parsed_org_id, original_filename)
+        return _sign_av_cpu(media_path_obj, certificate, private_key_pem, pepper, media, parsed_org_id, original_filename, profile=profile)
     elif profile.has_video:
-        return _sign_video_cpu(media_path_obj, certificate, private_key_pem, pepper, media, parsed_org_id, original_filename)
+        return _sign_video_cpu(media_path_obj, certificate, private_key_pem, pepper, media, parsed_org_id, original_filename, profile=profile)
     else:
-        return _sign_audio_cpu(media_path_obj, certificate, private_key_pem, pepper, media, parsed_org_id, original_filename)
+        return _sign_audio_cpu(media_path_obj, certificate, private_key_pem, pepper, media, parsed_org_id, original_filename, profile=profile)
 
 
 async def process_sign_job(
