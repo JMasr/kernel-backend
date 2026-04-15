@@ -37,6 +37,9 @@ data/fixtures/*.mov
 tests/fixtures/*.mp4
 tests/fixtures/*.aac
 
+# Benchmark results (per-run JSON)
+tests/benchmarks/results/*.json
+
 # Validation output
 scripts/output/
 

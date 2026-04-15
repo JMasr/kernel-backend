@@ -64,7 +64,7 @@ known-first-party = ["kernel_backend"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-v --tb=short -m 'not email'"
+addopts = "-v --tb=short -m 'not email and not benchmark'"
 # src layout: tell pytest where the package lives
 pythonpath = ["src"]
 markers = [
@@ -74,6 +74,7 @@ markers = [
     "slow: test takes more than 5 seconds",
     "boundary: import boundary enforcement tests",
     "email: sends real emails via Resend API — run manually only",
+    "benchmark: performance benchmarks; opt-in via make bench",
 ]
 
 [tool.mypy]
