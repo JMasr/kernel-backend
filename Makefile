@@ -62,6 +62,11 @@ release-gate:
 polygon:
 	$(PYTHON_INTERPRETER) -m pytest tests/ -m "polygon" -v
 
+## Performance benchmarks — opt-in; writes tests/benchmarks/results/<run>.json
+.PHONY: bench
+bench:
+	$(PYTHON_INTERPRETER) -m pytest tests/benchmarks/ -m benchmark -v
+
 ## Export librosa clips to data/audio/ (run once before make polygon)
 .PHONY: setup-polygon
 setup-polygon:

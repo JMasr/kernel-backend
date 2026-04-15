@@ -1,0 +1,67 @@
+{
+  "run_id": "20260414T100654Z-eab454a",
+  "host": {
+    "platform": "Linux-6.17.0-20-generic-x86_64-with-glibc2.39",
+    "cpu_count": 16,
+    "python": "3.11.14"
+  },
+  "records": [
+    {
+      "name": "sign_audio_120s",
+      "wall_s": 5.737999149016105,
+      "cpu_user_s": 22.58646,
+      "cpu_sys_s": 0.029782000000000086,
+      "cpu_children_user_s": 4.138160999999999,
+      "cpu_children_sys_s": 0.223837,
+      "peak_rss_kb": 171560,
+      "input_bytes": 10584078,
+      "extra": {
+        "input_seconds": 120.0,
+        "media": "audio_wav_mono_44100"
+      }
+    },
+    {
+      "name": "sign_av_speech",
+      "wall_s": 31.519398247939534,
+      "cpu_user_s": 95.154708,
+      "cpu_sys_s": 12.795978,
+      "cpu_children_user_s": 17.227616,
+      "cpu_children_sys_s": 2.333021,
+      "peak_rss_kb": 688584,
+      "input_bytes": 22910565,
+      "extra": {
+        "media": "av_mp4_speech_22mb"
+      }
+    },
+    {
+      "name": "verify_match_1_of_10",
+      "wall_s": 1.6875629529822618,
+      "cpu_user_s": 19.888429000000002,
+      "cpu_sys_s": 0.026087000000000082,
+      "cpu_children_user_s": 0.3113260000000002,
+      "cpu_children_sys_s": 0.164227,
+      "peak_rss_kb": 171252,
+      "input_bytes": 3048793,
+      "extra": {
+        "n_peppers": 10,
+        "match_position": 9,
+        "verdict": "Verdict.VERIFIED"
+      }
+    },
+    {
+      "name": "verify_miss_10_peppers",
+      "wall_s": 1.6942419690312818,
+      "cpu_user_s": 22.737851999999997,
+      "cpu_sys_s": 0.01927599999999996,
+      "cpu_children_user_s": 0.19282500000000002,
+      "cpu_children_sys_s": 0.14328999999999997,
+      "peak_rss_kb": 170960,
+      "input_bytes": 3051077,
+      "extra": {
+        "n_peppers": 10,
+        "match_position": null,
+        "verdict": "Verdict.RED"
+      }
+    }
+  ]
+}
