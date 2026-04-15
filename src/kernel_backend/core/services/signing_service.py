@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import hashlib
 import hmac
 import json
+import shutil
 import tempfile
 from collections.abc import Iterator
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import numpy as np
 
+from kernel_backend.config import get_settings
+from kernel_backend.core.domain.chunk import ChunkResult
 from kernel_backend.core.domain.dsp_manifest import PRODUCTION_MANIFEST as _M
 from kernel_backend.core.domain.identity import Certificate
 from kernel_backend.core.domain.manifest import CryptographicManifest
@@ -31,6 +36,13 @@ from kernel_backend.core.domain.watermark import (
 from kernel_backend.core.ports.media import MediaPort
 from kernel_backend.core.ports.registry import RegistryPort
 from kernel_backend.core.ports.storage import StoragePort
+from kernel_backend.core.services.chunk_assembler import (
+    cleanup_chunks,
+    concatenate_chunks,
+    validate_chunks,
+)
+from kernel_backend.core.services.chunk_planner import plan_chunks
+from kernel_backend.core.services.chunk_worker import process_video_chunk
 from kernel_backend.core.services.crypto_service import (
     derive_wid,
     sign_manifest,
@@ -625,6 +637,151 @@ def _sign_audio_cpu(
     )
 
 
+def _encode_signed_video_sequential(
+    media_path: Path,
+    media: MediaPort,
+    rs_n: int,
+    rs_symbols: list[int],
+    content_id: str,
+    author_public_key: str,
+    pepper: bytes,
+    vp: VideoEmbeddingParams,
+    width: int,
+    height: int,
+    fps: float,
+    crf: int,
+) -> Path:
+    """Single-process encode: decode the whole file once, embed per segment,
+    pipe to one ffmpeg. Raises ValueError on encoder failure."""
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        signed_path = Path(tmp.name)
+
+    encoder_proc = media.open_video_encode_stream(
+        width, height, fps, signed_path, crf=crf
+    )
+    try:
+        for seg_idx, seg_frames, _ in media.iter_video_segments(
+            media_path,
+            segment_duration_s=VIDEO_SEGMENT_S,
+            frame_stride=1,
+        ):
+            if seg_idx >= rs_n:
+                for frame in seg_frames:
+                    y, u, v = frame_to_yuvj420_planes(frame)
+                    encoder_proc.stdin.write(y)
+                    encoder_proc.stdin.write(u)
+                    encoder_proc.stdin.write(v)
+                continue
+
+            symbol_bits = np.array(
+                [(rs_symbols[seg_idx] >> (7 - k)) & 1 for k in range(8)],
+                dtype=np.uint8,
+            )
+
+            for frame in seg_frames:
+                y, u, v = embed_video_frame_yuvj420_planes(
+                    frame, symbol_bits, content_id,
+                    author_public_key, seg_idx, pepper,
+                    use_jnd_adaptive=vp.jnd_adaptive,
+                    jnd_params=vp,
+                )
+                encoder_proc.stdin.write(y)
+                encoder_proc.stdin.write(u)
+                encoder_proc.stdin.write(v)
+    finally:
+        if encoder_proc.stdin:
+            encoder_proc.stdin.close()
+        encoder_proc.wait()
+        if encoder_proc.returncode != 0:
+            signed_path.unlink(missing_ok=True)
+            raise ValueError(
+                f"FFmpeg video encode failed (returncode={encoder_proc.returncode})"
+            )
+    return signed_path
+
+
+def _encode_signed_video_chunked(
+    media_path: Path,
+    media: MediaPort,
+    rs_n: int,
+    rs_symbols: list[int],
+    content_id: str,
+    author_public_key: str,
+    pepper: bytes,
+    vp: VideoEmbeddingParams,
+    width: int,
+    height: int,
+    fps: float,
+    crf: int,
+) -> Path | None:
+    """Parallel chunked encode. Returns the signed Path, or None when the
+    planner collapses to a single chunk and the caller should fall back to
+    :func:`_encode_signed_video_sequential`. Raises ValueError on worker /
+    validation / concat failure.
+    """
+    settings = get_settings()
+    manifest = plan_chunks(
+        total_segments=rs_n,
+        segment_duration_s=VIDEO_SEGMENT_S,
+        n_workers=settings.CHUNK_WORKERS,
+        guard_segments=settings.CHUNK_GUARD_SEGMENTS,
+        min_payload_segments=settings.CHUNK_MIN_PAYLOAD_SEGMENTS,
+    )
+    if manifest.total_chunks == 1:
+        return None
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        signed_path = Path(tmp.name)
+
+    work_dir = Path(tempfile.mkdtemp(prefix="kernel_chunk_"))
+    vp_dict = asdict(vp)
+    rs_symbols_list = list(rs_symbols)
+    source_str = str(media_path)
+
+    results_dicts: list[dict] = []
+    try:
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=manifest.total_chunks
+        ) as pool:
+            futures = [
+                pool.submit(
+                    process_video_chunk,
+                    source_str,
+                    asdict(spec),
+                    rs_symbols_list,
+                    content_id,
+                    author_public_key,
+                    pepper,
+                    vp_dict,
+                    width,
+                    height,
+                    fps,
+                    crf,
+                    str(work_dir),
+                    VIDEO_SEGMENT_S,
+                )
+                for spec in manifest.chunks
+            ]
+            for fut in concurrent.futures.as_completed(futures):
+                results_dicts.append(fut.result())
+
+        results = [ChunkResult(**r) for r in results_dicts]
+        validation = validate_chunks(manifest, results, media.probe)
+        if not validation.is_valid:
+            raise ValueError(
+                "chunked signing failed validation: "
+                + "; ".join(validation.errors)
+            )
+        concatenate_chunks(results, signed_path)
+        return signed_path
+    except Exception:
+        signed_path.unlink(missing_ok=True)
+        raise
+    finally:
+        cleanup_chunks([ChunkResult(**r) for r in results_dicts])
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 def _sign_video_cpu(
     media_path: Path,
     certificate: Certificate,
@@ -700,54 +857,40 @@ def _sign_video_cpu(
     # 11. Get dimensions without loading frames — reuse the profile we already have
     fps = profile.fps
     width, height = profile.width, profile.height
-
-    # 12. Stream-encode: read one segment at a time, embed, pipe to FFmpeg
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        signed_path = Path(tmp.name)
-
     crf_to_use = output_crf if output_crf is not None else _compute_output_video_crf(profile.duration_s)
-    encoder_proc = media.open_video_encode_stream(width, height, fps, signed_path, crf=crf_to_use)
 
-    try:
-        for seg_idx, seg_frames, _ in media.iter_video_segments(
-            media_path,
-            segment_duration_s=VIDEO_SEGMENT_S,
-            frame_stride=1,   # signing: all frames, no striding
-        ):
-            if seg_idx >= rs_n:
-                # write remaining frames unmodified so video length is preserved
-                for frame in seg_frames:
-                    y, u, v = frame_to_yuvj420_planes(frame)
-                    encoder_proc.stdin.write(y)
-                    encoder_proc.stdin.write(u)
-                    encoder_proc.stdin.write(v)
-                continue
-
-            symbol_bits = np.array(
-                [(rs_symbols[seg_idx] >> (7 - k)) & 1 for k in range(8)],
-                dtype=np.uint8,
-            )
-
-            for frame in seg_frames:
-                y, u, v = embed_video_frame_yuvj420_planes(
-                    frame, symbol_bits, content_id,
-                    certificate.public_key_pem, seg_idx, pepper,
-                    use_jnd_adaptive=vp.jnd_adaptive,
-                    jnd_params=vp,
-                )
-                encoder_proc.stdin.write(y)
-                encoder_proc.stdin.write(u)
-                encoder_proc.stdin.write(v)
-
-    finally:
-        if encoder_proc.stdin:
-            encoder_proc.stdin.close()
-        encoder_proc.wait()
-        if encoder_proc.returncode != 0:
-            signed_path.unlink(missing_ok=True)
-            raise ValueError(
-                f"FFmpeg video encode failed (returncode={encoder_proc.returncode})"
-            )
+    # 12. Encode: try the chunked parallel pipeline first; the planner returns
+    # None when the video is too short or the worker count collapses to 1 —
+    # in that case we fall through to the sequential single-process encode.
+    signed_path = _encode_signed_video_chunked(
+        media_path=media_path,
+        media=media,
+        rs_n=rs_n,
+        rs_symbols=list(rs_symbols),
+        content_id=content_id,
+        author_public_key=certificate.public_key_pem,
+        pepper=pepper,
+        vp=vp,
+        width=width,
+        height=height,
+        fps=fps,
+        crf=crf_to_use,
+    )
+    if signed_path is None:
+        signed_path = _encode_signed_video_sequential(
+            media_path=media_path,
+            media=media,
+            rs_n=rs_n,
+            rs_symbols=list(rs_symbols),
+            content_id=content_id,
+            author_public_key=certificate.public_key_pem,
+            pepper=pepper,
+            vp=vp,
+            width=width,
+            height=height,
+            fps=fps,
+            crf=crf_to_use,
+        )
 
     signed_name = _make_signed_name(original_filename, ".mp4")
     storage_key = f"signed/{content_id}/{signed_name}"
@@ -1008,58 +1151,44 @@ def _sign_av_cpu(
                 encoder_proc.stdin.close()
             encoder_proc.wait()
 
-    # 14. Embed video — streaming encode, one segment at a time
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        video_signed_path = Path(tmp.name)
-
-    # Reuse the entry-probe profile — ffprobe is identical for the same file
+    # 14. Embed video — chunked parallel encode when the clip is long enough,
+    # otherwise fall back to the sequential single-process path. Both helpers
+    # return a Path to the encoded signed video.
     av_fps = profile.fps
     av_width, av_height = profile.width, profile.height
-
     av_crf_to_use = output_crf if output_crf is not None else _compute_output_video_crf(profile.duration_s)
-    video_encoder = media.open_video_encode_stream(av_width, av_height, av_fps, video_signed_path, crf=av_crf_to_use)
+
+    video_signed_path = _encode_signed_video_chunked(
+        media_path=media_path,
+        media=media,
+        rs_n=rs_n,
+        rs_symbols=list(rs_symbols),
+        content_id=content_id,
+        author_public_key=certificate.public_key_pem,
+        pepper=pepper,
+        vp=vp,
+        width=av_width,
+        height=av_height,
+        fps=av_fps,
+        crf=av_crf_to_use,
+    )
+    if video_signed_path is None:
+        video_signed_path = _encode_signed_video_sequential(
+            media_path=media_path,
+            media=media,
+            rs_n=rs_n,
+            rs_symbols=list(rs_symbols),
+            content_id=content_id,
+            author_public_key=certificate.public_key_pem,
+            pepper=pepper,
+            vp=vp,
+            width=av_width,
+            height=av_height,
+            fps=av_fps,
+            crf=av_crf_to_use,
+        )
+
     output_path: Path | None = None
-    try:
-        for seg_idx, seg_frames, _ in media.iter_video_segments(
-            media_path,
-            segment_duration_s=VIDEO_SEGMENT_S,
-            frame_stride=1,   # signing: all frames, no striding
-        ):
-            if seg_idx >= rs_n:
-                for frame in seg_frames:
-                    y, u, v = frame_to_yuvj420_planes(frame)
-                    video_encoder.stdin.write(y)
-                    video_encoder.stdin.write(u)
-                    video_encoder.stdin.write(v)
-                continue
-
-            symbol_bits = np.array(
-                [(rs_symbols[seg_idx] >> (7 - k)) & 1 for k in range(8)],
-                dtype=np.uint8,
-            )
-
-            for frame in seg_frames:
-                y, u, v = embed_video_frame_yuvj420_planes(
-                    frame, symbol_bits, content_id,
-                    certificate.public_key_pem, seg_idx, pepper,
-                    use_jnd_adaptive=vp.jnd_adaptive,
-                    jnd_params=vp,
-                )
-                video_encoder.stdin.write(y)
-                video_encoder.stdin.write(u)
-                video_encoder.stdin.write(v)
-
-    finally:
-        if video_encoder.stdin:
-            video_encoder.stdin.close()
-        video_encoder.wait()
-        if video_encoder.returncode != 0:
-            video_signed_path.unlink(missing_ok=True)
-            raise ValueError(
-                f"FFmpeg video encode failed in sign_av (returncode={video_encoder.returncode})"
-            )
-
-    output_path = None
     try:
         # 15. Mux signed audio + signed video
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
