@@ -1,3 +1,5 @@
+import hashlib
+import os
 from datetime import datetime, timezone
 
 from hypothesis import given, settings
@@ -9,6 +11,7 @@ from kernel_backend.core.services.crypto_service import (
     derive_wid,
     generate_keypair,
     sign_manifest,
+    streaming_file_hash,
     verify_manifest,
 )
 
@@ -100,3 +103,37 @@ def test_generate_keypair_returns_pem_strings() -> None:
     priv, pub = generate_keypair()
     assert priv.startswith("-----BEGIN PRIVATE KEY-----")
     assert pub.startswith("-----BEGIN PUBLIC KEY-----")
+
+
+def test_streaming_file_hash_matches_hashlib(tmp_path) -> None:
+    """streaming_file_hash must be bit-for-bit identical to hashlib one-shot."""
+    cases = [
+        b"",
+        b"x" * 17,
+        b"y" * (2**16),
+        b"z" * (2**16 + 12345),
+    ]
+    for i, data in enumerate(cases):
+        p = tmp_path / f"case_{i}.bin"
+        p.write_bytes(data)
+        assert streaming_file_hash(p) == hashlib.sha256(data).hexdigest()
+
+
+def test_streaming_file_hash_block_size_invariant(tmp_path) -> None:
+    """Digest must be independent of block_size — validates the streaming contract."""
+    p = tmp_path / "random.bin"
+    p.write_bytes(os.urandom(1 << 20))  # 1 MiB
+
+    expected = streaming_file_hash(p)
+    for bs in (1, 17, 4096, 2**20, 2**21):
+        assert streaming_file_hash(p, block_size=bs) == expected
+
+
+def test_streaming_file_hash_algorithm_parameter(tmp_path) -> None:
+    """algorithm=sha512 must call hashlib.new('sha512') correctly."""
+    p = tmp_path / "f.bin"
+    p.write_bytes(b"hello world")
+    assert (
+        streaming_file_hash(p, algorithm="sha512")
+        == hashlib.sha512(b"hello world").hexdigest()
+    )
