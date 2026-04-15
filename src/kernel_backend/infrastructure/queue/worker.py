@@ -26,7 +26,10 @@ async def on_startup(ctx: dict) -> None:
     ctx["storage"] = make_storage(settings)
     ctx["registry"] = SessionFactoryRegistry(session_factory)
     ctx["pepper"] = settings.system_pepper_bytes
-    ctx["process_pool"] = concurrent.futures.ProcessPoolExecutor(max_workers=2)
+    ctx["process_pool"] = concurrent.futures.ProcessPoolExecutor(
+        max_workers=settings.SIGN_POOL_MAX_WORKERS,
+        max_tasks_per_child=settings.SIGN_POOL_MAX_TASKS_PER_CHILD,
+    )
     ctx["_engine"] = engine
     if settings.RESEND_API_KEY:
         ctx["email_adapter"] = ResendEmailAdapter(
@@ -61,7 +64,7 @@ class WorkerSettings:
     graceful_shutdown_timeout = 360  # 6 minutes
 
     # Concurrent jobs per worker process. CPU-intensive jobs; leave headroom for the OS.
-    max_jobs = 4
+    max_jobs = _settings.ARQ_MAX_JOBS
 
     # How long to keep job results in Redis.
     keep_result = 3600  # 1 hour
