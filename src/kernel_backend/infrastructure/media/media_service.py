@@ -268,6 +268,7 @@ class MediaService(MediaPort):
         fps: float,
         output_path: Path,
         crf: int = 18,
+        force_keyframes_every_s: float | None = None,
     ):
         """
         Opens an FFmpeg subprocess for streaming H.264 video encode.
@@ -277,6 +278,10 @@ class MediaService(MediaPort):
         Default CRF raised 28 → 18 (better visual quality).
         Calibration: 0/24 QIM watermark errors at CRF 0/18/23/28.
         The signing_service passes the adaptive CRF computed from media duration.
+
+        ``force_keyframes_every_s`` — when set, pins a keyframe at every
+        multiple of this interval so the chunked pipeline can trim with
+        ``ffmpeg -c copy`` on segment boundaries.
         """
         import subprocess
 
@@ -288,9 +293,13 @@ class MediaService(MediaPort):
             "-i", "pipe:0",
             "-vcodec", "libx264", "-crf", str(crf), "-preset", "ultrafast",
             "-pix_fmt", "yuvj420p",
-            "-loglevel", "quiet",
-            str(output_path),
         ]
+        if force_keyframes_every_s is not None:
+            cmd.extend([
+                "-force_key_frames",
+                f"expr:gte(t,n_forced*{force_keyframes_every_s})",
+            ])
+        cmd.extend(["-loglevel", "quiet", str(output_path)])
         return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
     def mux_video_audio(
@@ -464,3 +473,98 @@ class MediaService(MediaPort):
                 segment_idx += 1
         finally:
             cap.release()
+
+    def iter_video_segments_range(
+        self,
+        path: Path,
+        decode_start_s: float,
+        decode_end_s: float,
+        segment_duration_s: float = 5.0,
+        frame_stride: int = 1,
+    ):
+        """Lazily yield ``(local_seg_idx, frames, fps)`` over a time range.
+
+        Wraps ``ffmpeg -ss <start> -i <path> -t <duration> -f rawvideo
+        -pix_fmt bgr24 pipe:1`` and slices the raw stdout stream into
+        per-segment frame lists. Used by the chunked signing pipeline so
+        each worker only decodes its own slice of the source.
+
+        Frames are emitted as BGR ``np.ndarray`` views over fresh buffers,
+        matching the shape of :meth:`iter_video_segments`. ``local_seg_idx``
+        is zero-based relative to ``decode_start_s``; the caller translates
+        it into a global segment index.
+        """
+        import subprocess
+
+        if decode_end_s <= decode_start_s:
+            raise ValueError(
+                f"decode_end_s ({decode_end_s}) must exceed "
+                f"decode_start_s ({decode_start_s})"
+            )
+
+        profile = self.probe(path)
+        if not profile.has_video:
+            raise ValueError(f"{path} has no video stream")
+
+        fps = profile.fps
+        width, height = profile.width, profile.height
+        if fps <= 0 or width <= 0 or height <= 0:
+            raise ValueError(
+                f"Invalid video profile: fps={fps}, {width}x{height}"
+            )
+
+        segment_frame_count = int(segment_duration_s * fps)
+        if segment_frame_count <= 0:
+            raise ValueError(
+                f"segment_duration_s={segment_duration_s} yields 0 frames at fps={fps}"
+            )
+
+        duration_s = decode_end_s - decode_start_s
+        frame_bytes = width * height * 3
+
+        cmd = [
+            "ffmpeg",
+            "-ss", f"{decode_start_s:.6f}",
+            "-i", str(path),
+            "-t", f"{duration_s:.6f}",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-loglevel", "quiet",
+            "pipe:1",
+        ]
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        assert proc.stdout is not None
+
+        try:
+            segment_idx = 0
+            while True:
+                frames: list[np.ndarray] = []
+                frames_read = 0
+                for i in range(segment_frame_count):
+                    buf = proc.stdout.read(frame_bytes)
+                    if not buf or len(buf) < frame_bytes:
+                        break
+                    if i % frame_stride == 0:
+                        frame = np.frombuffer(buf, dtype=np.uint8).reshape(
+                            height, width, 3
+                        ).copy()
+                        frames.append(frame)
+                    frames_read += 1
+
+                if not frames:
+                    break
+
+                yield segment_idx, frames, fps
+
+                if frames_read < segment_frame_count:
+                    break
+
+                segment_idx += 1
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            proc.wait(timeout=10)
