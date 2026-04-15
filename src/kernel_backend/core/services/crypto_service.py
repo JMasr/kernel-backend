@@ -1,3 +1,6 @@
+import hashlib
+from pathlib import Path
+
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -78,6 +81,28 @@ def derive_wid(signature: bytes, content_id: str) -> WatermarkID:
         info=b"kernel_wid_v2",
     )
     return WatermarkID(data=hkdf.derive(signature))
+
+
+def streaming_file_hash(
+    path: Path,
+    algorithm: str = "sha256",
+    block_size: int = 2**16,
+) -> str:
+    """
+    Hash a file in fixed-size chunks without loading it fully into memory.
+
+    Returns the hex digest. Used by the signing pipeline to compute
+    ``content_hash_sha256`` without a ``read_bytes()`` peak RSS spike.
+
+    ``algorithm`` accepts any name supported by ``hashlib.new``;
+    ``block_size`` defaults to 64 KiB — large enough to amortize read()
+    syscalls, small enough to keep peak memory bounded on any file size.
+    """
+    h = hashlib.new(algorithm)
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(block_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _manifest_to_dict(manifest: CryptographicManifest) -> dict:
