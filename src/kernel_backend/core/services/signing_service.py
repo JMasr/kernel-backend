@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import tempfile
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -14,6 +15,7 @@ import numpy as np
 from kernel_backend.core.domain.dsp_manifest import PRODUCTION_MANIFEST as _M
 from kernel_backend.core.domain.identity import Certificate
 from kernel_backend.core.domain.manifest import CryptographicManifest
+from kernel_backend.core.domain.media import MediaProfile
 from kernel_backend.core.domain.signing import RawSigningPayload, SigningResult
 from kernel_backend.core.domain.watermark import (
     AudioEmbeddingParams,
@@ -29,7 +31,11 @@ from kernel_backend.core.domain.watermark import (
 from kernel_backend.core.ports.media import MediaPort
 from kernel_backend.core.ports.registry import RegistryPort
 from kernel_backend.core.ports.storage import StoragePort
-from kernel_backend.core.services.crypto_service import derive_wid, sign_manifest
+from kernel_backend.core.services.crypto_service import (
+    derive_wid,
+    sign_manifest,
+    streaming_file_hash,
+)
 from kernel_backend.core.domain.content_profile import routing_decision_to_dict
 from kernel_backend.core.domain.video_content_profile import (
     video_routing_decision_to_dict as _video_routing_to_dict,
@@ -65,8 +71,8 @@ from kernel_backend.engine.video.fingerprint import extract_hashes as extract_vi
 from kernel_backend.engine.video.fingerprint import SEGMENT_DURATION_S as VIDEO_SEGMENT_S
 from kernel_backend.engine.video.wid_watermark import (
     embed_segment as embed_video_segment,
-    embed_video_frame,
-    frame_to_yuv420,
+    embed_video_frame_yuvj420_planes,
+    frame_to_yuvj420_planes,
 )
 
 
@@ -120,6 +126,60 @@ def _compute_output_video_crf(duration_s: float) -> int:
 
 
 # ── End output encoding helpers ───────────────────────────────────────────────
+
+
+class _PCMChunkScratch:
+    """
+    On-disk spill buffer for float32 PCM segments.
+
+    Pass 1 of the signing pipeline decodes the input audio once with ffmpeg
+    and streams every 2s chunk through here instead of a Python list. Pass 2
+    reads the chunks back sequentially, embeds the selected segments, and
+    pipes the result to the output encoder.
+
+    Peak RSS stays at ~one chunk (~353 KB) regardless of audio duration;
+    disk usage is ~10 MB per minute of audio, transient, cleaned on exit.
+    """
+
+    def __init__(self, suffix: str = ".pcm") -> None:
+        self._file = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        self._path = Path(self._file.name)
+        self._lengths: list[int] = []
+        self._finalized = False
+
+    def append(self, chunk: np.ndarray) -> None:
+        """Write one chunk. Must be called before ``finalize()``."""
+        arr = np.ascontiguousarray(chunk, dtype=np.float32)
+        self._lengths.append(int(arr.size))
+        self._file.write(arr.tobytes())
+
+    def finalize(self) -> None:
+        """Close the writer so the file can be re-opened for reading."""
+        if not self._finalized:
+            self._file.close()
+            self._finalized = True
+
+    def __len__(self) -> int:
+        return len(self._lengths)
+
+    def __iter__(self) -> "Iterator[np.ndarray]":
+        """Yield chunks in the order they were appended."""
+        if not self._finalized:
+            self.finalize()
+        with self._path.open("rb") as fh:
+            for n in self._lengths:
+                raw = fh.read(n * 4)
+                yield np.frombuffer(raw, dtype=np.float32)
+
+    def __enter__(self) -> "_PCMChunkScratch":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        try:
+            self.finalize()
+        finally:
+            self._path.unlink(missing_ok=True)
+
 
 _DEFAULT_AUDIO_PARAMS = AudioEmbeddingParams(
     dwt_levels=_M.audio_wid.dwt_levels,
@@ -299,13 +359,16 @@ def _sample_video_frames(
     media_path: Path,
     media: MediaPort,
     n_frames: int = 5,
+    profile: MediaProfile | None = None,
 ) -> list[np.ndarray]:
     """Sample representative BGR frames for video content profiling.
 
     Grabs frames at positions [10%, 25%, 50%, 75%, 90%] of the video.
-    Uses seek_frame to minimize I/O.
+    Uses seek_frame to minimize I/O. Accepts a preloaded ``profile`` to
+    skip the extra ffprobe spawn when the caller already has one.
     """
-    profile = media.probe(media_path)
+    if profile is None:
+        profile = media.probe(media_path)
     duration = profile.duration_s
     if duration <= 0:
         duration = 10.0  # fallback
@@ -349,10 +412,12 @@ def _sign_audio_cpu(
     org_id: UUID | None = None,
     original_filename: str = "",
     audio_params: AudioEmbeddingParams | None = None,
+    profile: MediaProfile | None = None,
 ) -> RawSigningPayload:
     """CPU phase of audio signing. Returns a serialisable RawSigningPayload."""
-    # 1. Probe
-    profile = media.probe(media_path)
+    # 1. Probe (reuse caller-supplied profile to avoid redundant ffprobe spawn)
+    if profile is None:
+        profile = media.probe(media_path)
     if profile.container_type == "video_only":
         raise ValueError("Container has no audio track — cannot sign audio-only pipeline")
 
@@ -369,7 +434,7 @@ def _sign_audio_cpu(
 
     # 2–3. IDs and content hash
     content_id = str(uuid4())
-    content_hash = hashlib.sha256(media_path.read_bytes()).hexdigest()
+    content_hash = streaming_file_hash(media_path)
 
     # 4. Target sample rate for audio orchestration
     target_sample_rate = 44100
@@ -378,147 +443,148 @@ def _sign_audio_cpu(
     # Count non-overlapping 2s chunks alongside fingerprint extraction.
     # extract_hashes_from_stream uses overlap=0.5, so len(fingerprints) > n_wid_segments.
     # rs_n must match the number of non-overlapping WID segments, not fingerprint count.
-    # Also score each segment for content-adaptive placement.
-    wid_segment_counter: list[int] = [0]
+    # Also score each segment for content-adaptive placement, and cache the decoded
+    # chunks so the embed pass reuses them instead of re-running ffmpeg on the file.
     segment_scores: list[tuple[int, float, float, float, float]] = []
 
-    def _counting_stream():
-        for seg_idx, chunk, _ in media.iter_audio_segments(
-            media_path, segment_duration_s=2.0, target_sample_rate=target_sample_rate
-        ):
-            wid_segment_counter[0] += 1
-            sc = score_segment(chunk, target_sample_rate,
-                               dwt_level=ap.dwt_levels[0],
-                               target_subband=ap.target_subband)
-            segment_scores.append(
-                (seg_idx, sc.rms_db, sc.band_energy_db,
-                 sc.spectral_flatness, sc.transient_density)
+    with _PCMChunkScratch() as scratch:
+        def _counting_stream():
+            for seg_idx, chunk, _ in media.iter_audio_segments(
+                media_path, segment_duration_s=2.0, target_sample_rate=target_sample_rate
+            ):
+                scratch.append(chunk)
+                sc = score_segment(chunk, target_sample_rate,
+                                   dwt_level=ap.dwt_levels[0],
+                                   target_subband=ap.target_subband)
+                segment_scores.append(
+                    (seg_idx, sc.rms_db, sc.band_energy_db,
+                     sc.spectral_flatness, sc.transient_density)
+                )
+                yield chunk
+
+        fingerprints = extract_audio_hashes_from_stream(
+            _counting_stream(),
+            target_sample_rate,
+            key_material=pepper,
+            pepper=pepper,
+        )
+        scratch.finalize()
+        n_wid_segments = len(scratch)
+
+        # 6. RS parameters — based on non-overlapping WID segment count
+        rs_n = min(n_wid_segments, 255)
+        if rs_n < 17:
+            duration_s = n_wid_segments * 2  # 2 seconds per segment
+            raise ValueError(
+                f"Audio is too short to sign. Your file is approximately {duration_s} seconds, "
+                f"but the minimum required duration is 34 seconds."
             )
-            yield chunk
 
-    fingerprints = extract_audio_hashes_from_stream(
-        _counting_stream(),
-        target_sample_rate,
-        key_material=pepper,
-        pepper=pepper,
-    )
-    n_wid_segments = wid_segment_counter[0]
-
-    # 6. RS parameters — based on non-overlapping WID segment count
-    rs_n = min(n_wid_segments, 255)
-    if rs_n < 17:
-        duration_s = n_wid_segments * 2  # 2 seconds per segment
-        raise ValueError(
-            f"Audio is too short to sign. Your file is approximately {duration_s} seconds, "
-            f"but the minimum required duration is 34 seconds."
+        # 7. Manifest
+        manifest = CryptographicManifest(
+            content_id=content_id,
+            content_hash_sha256=content_hash,
+            fingerprints_audio=[fp.hash_hex for fp in fingerprints],
+            fingerprints_video=[],
+            author_id=certificate.author_id,
+            author_public_key=certificate.public_key_pem,
+            created_at=datetime.now(timezone.utc).isoformat(),
         )
 
-    # 7. Manifest
-    manifest = CryptographicManifest(
-        content_id=content_id,
-        content_hash_sha256=content_hash,
-        fingerprints_audio=[fp.hash_hex for fp in fingerprints],
-        fingerprints_video=[],
-        author_id=certificate.author_id,
-        author_public_key=certificate.public_key_pem,
-        created_at=datetime.now(timezone.utc).isoformat(),
-    )
+        # 8. Sign
+        signature = sign_manifest(manifest, private_key_pem)
 
-    # 8. Sign
-    signature = sign_manifest(manifest, private_key_pem)
+        # 9. Derive WID
+        wid = derive_wid(signature, content_id)
 
-    # 9. Derive WID
-    wid = derive_wid(signature, content_id)
+        # 10a. Content-adaptive segment selection
+        # Build scored SegmentScores from the raw metrics collected during Pass 1.
+        scored_segments = scores_from_raw_metrics(segment_scores)
+        selected_indices = select_best(scored_segments, n_needed=rs_n)
+        segment_map = SegmentMap(
+            selected_indices=tuple(selected_indices),
+            total_segments=n_wid_segments,
+        )
 
-    # 10a. Content-adaptive segment selection
-    # Build scored SegmentScores from the raw metrics collected during Pass 1.
-    scored_segments = scores_from_raw_metrics(segment_scores)
-    selected_indices = select_best(scored_segments, n_needed=rs_n)
-    segment_map = SegmentMap(
-        selected_indices=tuple(selected_indices),
-        total_segments=n_wid_segments,
-    )
+        # Attach segment map to audio params for serialization
+        ap = AudioEmbeddingParams(
+            dwt_levels=ap.dwt_levels,
+            chips_per_bit=ap.chips_per_bit,
+            psychoacoustic=ap.psychoacoustic,
+            safety_margin_db=ap.safety_margin_db,
+            target_snr_db=ap.target_snr_db,
+            target_subband=ap.target_subband,
+            frame_length_ms=ap.frame_length_ms,
+            pn_sequence_length=ap.pn_sequence_length,
+            segment_map=segment_map,
+        )
 
-    # Attach segment map to audio params for serialization
-    ap = AudioEmbeddingParams(
-        dwt_levels=ap.dwt_levels,
-        chips_per_bit=ap.chips_per_bit,
-        psychoacoustic=ap.psychoacoustic,
-        safety_margin_db=ap.safety_margin_db,
-        target_snr_db=ap.target_snr_db,
-        target_subband=ap.target_subband,
-        frame_length_ms=ap.frame_length_ms,
-        pn_sequence_length=ap.pn_sequence_length,
-        segment_map=segment_map,
-    )
+        # 10b–11. Hopping plan + RS symbols
+        # band_configs and rs_symbols are indexed by RS symbol position (0..rs_n-1),
+        # NOT by absolute segment index. The segment_map provides the indirection.
+        band_configs = plan_audio_hopping(
+            rs_n, content_id, certificate.public_key_pem, pepper,
+            force_levels=list(ap.dwt_levels),
+            target_subband=ap.target_subband,
+        )
+        rs_symbols = ReedSolomonCodec(rs_n).encode(wid.data)
 
-    # 10b–11. Hopping plan + RS symbols
-    # band_configs and rs_symbols are indexed by RS symbol position (0..rs_n-1),
-    # NOT by absolute segment index. The segment_map provides the indirection.
-    band_configs = plan_audio_hopping(
-        rs_n, content_id, certificate.public_key_pem, pepper,
-        force_levels=list(ap.dwt_levels),
-        target_subband=ap.target_subband,
-    )
-    rs_symbols = ReedSolomonCodec(rs_n).encode(wid.data)
+        # Build segment→RS mapping for the embedding loop
+        selected_set = set(segment_map.selected_indices)
+        _seg_to_rs = {seg_idx: rs_idx
+                      for rs_idx, seg_idx in enumerate(segment_map.selected_indices)}
 
-    # Build segment→RS mapping for the embedding loop
-    selected_set = set(segment_map.selected_indices)
-    _seg_to_rs = {seg_idx: rs_idx
-                  for rs_idx, seg_idx in enumerate(segment_map.selected_indices)}
+        # 13–15. Pass 2 Streaming: Encode and Embed
+        # Determine output format before creating temp file so the suffix matches.
+        # For lossless sources (WAV/FLAC/ALAC): write watermarked PCM back as WAV —
+        # no lossy re-encoding stage; DWT-DSSS works on raw samples internally.
+        # For lossy sources: AAC with adaptive bitrate ≥ source, floor 256k, ceiling 384k.
+        #
+        # Note on .m4a vs .wav: .m4a creates an edit list (elst) that compensates for
+        # the ~1024-sample AAC encoder priming delay. For WAV output the delay is zero.
+        output_bitrate = _compute_output_audio_bitrate(profile.audio_bitrate_bps)
+        is_lossless_out = output_bitrate is None
+        out_suffix       = ".wav" if is_lossless_out else ".m4a"
+        out_codec        = "pcm_s16le" if is_lossless_out else "aac"
+        out_content_type = "audio/wav" if is_lossless_out else "audio/aac"
 
-    # 13–15. Pass 2 Streaming: Encode and Embed
-    # Determine output format before creating temp file so the suffix matches.
-    # For lossless sources (WAV/FLAC/ALAC): write watermarked PCM back as WAV —
-    # no lossy re-encoding stage; DWT-DSSS works on raw samples internally.
-    # For lossy sources: AAC with adaptive bitrate ≥ source, floor 256k, ceiling 384k.
-    #
-    # Note on .m4a vs .wav: .m4a creates an edit list (elst) that compensates for
-    # the ~1024-sample AAC encoder priming delay. For WAV output the delay is zero.
-    output_bitrate = _compute_output_audio_bitrate(profile.audio_bitrate_bps)
-    is_lossless_out = output_bitrate is None
-    out_suffix       = ".wav" if is_lossless_out else ".m4a"
-    out_codec        = "pcm_s16le" if is_lossless_out else "aac"
-    out_content_type = "audio/wav" if is_lossless_out else "audio/aac"
+        with tempfile.NamedTemporaryFile(suffix=out_suffix, delete=False) as tmp:
+            signed_path = Path(tmp.name)
 
-    with tempfile.NamedTemporaryFile(suffix=out_suffix, delete=False) as tmp:
-        signed_path = Path(tmp.name)
-
-    encoder_proc = media.encode_audio_stream(
-        sample_rate=target_sample_rate,
-        output_path=signed_path,
-        codec=out_codec,
-        bitrate=output_bitrate,   # None → no -b:a flag for PCM
-    )
-    try:
-        for seg_idx, chunk, _ in media.iter_audio_segments(
-            media_path, segment_duration_s=2.0, target_sample_rate=target_sample_rate
-        ):
-            if seg_idx in selected_set:
-                rs_idx = _seg_to_rs[seg_idx]
-                pn_seed = int.from_bytes(
-                    hmac.new(
-                        pepper,
-                        f"wid|{content_id}|{certificate.public_key_pem}|{rs_idx}".encode(),
-                        hashlib.sha256,
-                    ).digest()[:8],
-                    "big",
-                )
-                chunk = embed_audio_segment(
-                    chunk, rs_symbols[rs_idx], band_configs[rs_idx], pn_seed,
-                    chips_per_bit=ap.chips_per_bit,
-                    target_snr_db=ap.target_snr_db,
-                    use_psychoacoustic=ap.psychoacoustic,
-                    safety_margin_db=ap.safety_margin_db,
-                )
+        encoder_proc = media.encode_audio_stream(
+            sample_rate=target_sample_rate,
+            output_path=signed_path,
+            codec=out_codec,
+            bitrate=output_bitrate,   # None → no -b:a flag for PCM
+        )
+        # Prebuild the per-file HMAC prefix once; per-segment seeding is then a
+        # cheap copy() + update() instead of reconstructing the HMAC from scratch.
+        _wid_prefix = f"wid|{content_id}|{certificate.public_key_pem}|".encode()
+        _wid_base_hmac = hmac.new(pepper, _wid_prefix, hashlib.sha256)
+        try:
+            # Pass 2: stream chunks back from the on-disk scratch — no second
+            # ffmpeg subprocess, and peak RSS is bounded to ~one chunk.
+            for seg_idx, chunk in enumerate(scratch):
+                if seg_idx in selected_set:
+                    rs_idx = _seg_to_rs[seg_idx]
+                    h = _wid_base_hmac.copy()
+                    h.update(str(rs_idx).encode())
+                    pn_seed = int.from_bytes(h.digest()[:8], "big")
+                    chunk = embed_audio_segment(
+                        chunk, rs_symbols[rs_idx], band_configs[rs_idx], pn_seed,
+                        chips_per_bit=ap.chips_per_bit,
+                        target_snr_db=ap.target_snr_db,
+                        use_psychoacoustic=ap.psychoacoustic,
+                        safety_margin_db=ap.safety_margin_db,
+                    )
+                if encoder_proc.stdin:
+                    encoder_proc.stdin.write(
+                        (np.clip(chunk, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+                    )
+        finally:
             if encoder_proc.stdin:
-                encoder_proc.stdin.write(
-                    (np.clip(chunk, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
-                )
-    finally:
-        if encoder_proc.stdin:
-            encoder_proc.stdin.close()
-        encoder_proc.wait()
+                encoder_proc.stdin.close()
+            encoder_proc.wait()
 
     signed_name = _make_signed_name(original_filename, media_path.suffix, force_ext=out_suffix)
     storage_key = f"signed/{content_id}/{signed_name}"
@@ -569,10 +635,12 @@ def _sign_video_cpu(
     original_filename: str = "",
     video_params: VideoEmbeddingParams | None = None,
     output_crf: int | None = None,
+    profile: MediaProfile | None = None,
 ) -> RawSigningPayload:
     """CPU phase of video signing. Returns a serialisable RawSigningPayload."""
-    # 1. Probe — reject audio-only containers
-    profile = media.probe(media_path)
+    # 1. Probe — reject audio-only containers (reuse caller-supplied profile)
+    if profile is None:
+        profile = media.probe(media_path)
     if not profile.has_video:
         raise ValueError("Container has no video track — cannot sign video-only pipeline")
 
@@ -581,7 +649,7 @@ def _sign_video_cpu(
     if video_params is not None:
         vp = video_params
     else:
-        sample_frames = _sample_video_frames(media_path, media)
+        sample_frames = _sample_video_frames(media_path, media, profile=profile)
         video_profile = _profile_video(sample_frames)
         video_routing = _route_video(video_profile)
         vp = _video_routing_to_params(video_routing)
@@ -589,7 +657,7 @@ def _sign_video_cpu(
 
     # 2–3. IDs and content hash
     content_id = str(uuid4())
-    content_hash = hashlib.sha256(media_path.read_bytes()).hexdigest()
+    content_hash = streaming_file_hash(media_path)
 
     # 4. Video fingerprint (drives segment count)
     video_fingerprints = extract_video_hashes(
@@ -629,8 +697,7 @@ def _sign_video_cpu(
     # 10. RS symbols
     rs_symbols = ReedSolomonCodec(rs_n).encode(wid.data)
 
-    # 11. Get dimensions without loading frames
-    profile = media.probe(media_path)
+    # 11. Get dimensions without loading frames — reuse the profile we already have
     fps = profile.fps
     width, height = profile.width, profile.height
 
@@ -650,7 +717,10 @@ def _sign_video_cpu(
             if seg_idx >= rs_n:
                 # write remaining frames unmodified so video length is preserved
                 for frame in seg_frames:
-                    encoder_proc.stdin.write(frame_to_yuv420(frame))
+                    y, u, v = frame_to_yuvj420_planes(frame)
+                    encoder_proc.stdin.write(y)
+                    encoder_proc.stdin.write(u)
+                    encoder_proc.stdin.write(v)
                 continue
 
             symbol_bits = np.array(
@@ -659,13 +729,15 @@ def _sign_video_cpu(
             )
 
             for frame in seg_frames:
-                frame = embed_video_frame(
+                y, u, v = embed_video_frame_yuvj420_planes(
                     frame, symbol_bits, content_id,
                     certificate.public_key_pem, seg_idx, pepper,
                     use_jnd_adaptive=vp.jnd_adaptive,
                     jnd_params=vp,
                 )
-                encoder_proc.stdin.write(frame_to_yuv420(frame))
+                encoder_proc.stdin.write(y)
+                encoder_proc.stdin.write(u)
+                encoder_proc.stdin.write(v)
 
     finally:
         if encoder_proc.stdin:
@@ -725,10 +797,12 @@ def _sign_av_cpu(
     audio_params: AudioEmbeddingParams | None = None,
     video_params: VideoEmbeddingParams | None = None,
     output_crf: int | None = None,
+    profile: MediaProfile | None = None,
 ) -> RawSigningPayload:
     """CPU phase of AV signing (single shared WID). Returns a serialisable RawSigningPayload."""
-    # 1. Probe — require both tracks
-    profile = media.probe(media_path)
+    # 1. Probe — require both tracks (reuse caller-supplied profile)
+    if profile is None:
+        profile = media.probe(media_path)
     if not profile.has_video or not profile.has_audio:
         raise ValueError(
             "sign_av requires both audio and video tracks. "
@@ -760,6 +834,7 @@ def _sign_av_cpu(
                 media_path, certificate, private_key_pem, pepper, media,
                 org_id=org_id, original_filename=original_filename,
                 video_params=video_params, output_crf=output_crf,
+                profile=profile,
             )
 
     # 1c. Video content profiling + adaptive routing
@@ -767,7 +842,7 @@ def _sign_av_cpu(
     if video_params is not None:
         vp = video_params
     else:
-        sample_frames = _sample_video_frames(media_path, media)
+        sample_frames = _sample_video_frames(media_path, media, profile=profile)
         video_profile = _profile_video(sample_frames)
         video_routing = _route_video(video_profile)
         vp = _video_routing_to_params(video_routing)
@@ -784,163 +859,162 @@ def _sign_av_cpu(
 
     # 2–3. IDs + content hash
     content_id = str(uuid4())
-    content_hash = hashlib.sha256(media_path.read_bytes()).hexdigest()
+    content_hash = streaming_file_hash(media_path)
 
-    # 4. Audio fingerprints (streaming — avoids loading all audio into memory)
-    #    Also score each segment for content-adaptive placement.
+    # 4. Audio fingerprints (streaming) + segment scoring + chunk cache.
+    #    Caching the chunks lets the embed pass reuse them instead of starting
+    #    a second ffmpeg decode of the same file.
     target_sample_rate = 44100
     av_segment_scores: list[tuple[int, float, float, float, float]] = []
-    av_wid_segment_counter: list[int] = [0]
 
-    def _av_scoring_stream():
-        for seg_idx, chunk, _ in media.iter_audio_segments(
-            media_path, segment_duration_s=2.0, target_sample_rate=target_sample_rate
-        ):
-            av_wid_segment_counter[0] += 1
-            sc = score_segment(chunk, target_sample_rate,
-                               dwt_level=ap.dwt_levels[0],
-                               target_subband=ap.target_subband)
-            av_segment_scores.append(
-                (seg_idx, sc.rms_db, sc.band_energy_db,
-                 sc.spectral_flatness, sc.transient_density)
+    with _PCMChunkScratch() as av_scratch:
+        def _av_scoring_stream():
+            for seg_idx, chunk, _ in media.iter_audio_segments(
+                media_path, segment_duration_s=2.0, target_sample_rate=target_sample_rate
+            ):
+                av_scratch.append(chunk)
+                sc = score_segment(chunk, target_sample_rate,
+                                   dwt_level=ap.dwt_levels[0],
+                                   target_subband=ap.target_subband)
+                av_segment_scores.append(
+                    (seg_idx, sc.rms_db, sc.band_energy_db,
+                     sc.spectral_flatness, sc.transient_density)
+                )
+                yield chunk
+
+        audio_fingerprints = extract_audio_hashes_from_stream(
+            _av_scoring_stream(), target_sample_rate, key_material=pepper, pepper=pepper
+        )
+        av_scratch.finalize()
+
+        # 6. Video fingerprints
+        video_fingerprints = extract_video_hashes(
+            str(media_path), key_material=pepper, pepper=pepper
+        )
+
+        # 7. RS parameters — use the SMALLER rs_n so both channels stay in sync
+        n_av_wid_segments = len(av_scratch)
+        rs_n_audio = min(n_av_wid_segments, 255)
+        rs_n_video = min(len(video_fingerprints), 255)
+        if rs_n_audio < 17:
+            duration_s = rs_n_audio * 2  # 2 seconds per segment
+            raise ValueError(
+                f"Audio track is too short to sign. Your file's audio is approximately {duration_s} seconds, "
+                f"but the minimum required duration is 34 seconds."
             )
-            yield chunk
+        if rs_n_video < 17:
+            duration_s = rs_n_video * 5  # 5 seconds per segment
+            raise ValueError(
+                f"Video track is too short to sign. Your file's video is approximately {duration_s} seconds, "
+                f"but the minimum required duration is 85 seconds."
+            )
+        rs_n = min(rs_n_audio, rs_n_video)
 
-    audio_fingerprints = extract_audio_hashes_from_stream(
-        _av_scoring_stream(), target_sample_rate, key_material=pepper, pepper=pepper
-    )
-
-    # 6. Video fingerprints
-    video_fingerprints = extract_video_hashes(
-        str(media_path), key_material=pepper, pepper=pepper
-    )
-
-    # 7. RS parameters — use the SMALLER rs_n so both channels stay in sync
-    n_av_wid_segments = av_wid_segment_counter[0]
-    rs_n_audio = min(n_av_wid_segments, 255)
-    rs_n_video = min(len(video_fingerprints), 255)
-    if rs_n_audio < 17:
-        duration_s = rs_n_audio * 2  # 2 seconds per segment
-        raise ValueError(
-            f"Audio track is too short to sign. Your file's audio is approximately {duration_s} seconds, "
-            f"but the minimum required duration is 34 seconds."
+        # 8. Single manifest covering BOTH channels
+        active_signals = [
+            "audio_wid", "audio_fingerprint",
+            "video_wid", "video_fingerprint",
+        ]
+        manifest = CryptographicManifest(
+            content_id=content_id,
+            content_hash_sha256=content_hash,
+            fingerprints_audio=[fp.hash_hex for fp in audio_fingerprints],
+            fingerprints_video=[fp.hash_hex for fp in video_fingerprints],
+            author_id=certificate.author_id,
+            author_public_key=certificate.public_key_pem,
+            created_at=datetime.now(timezone.utc).isoformat(),
         )
-    if rs_n_video < 17:
-        duration_s = rs_n_video * 5  # 5 seconds per segment
-        raise ValueError(
-            f"Video track is too short to sign. Your file's video is approximately {duration_s} seconds, "
-            f"but the minimum required duration is 85 seconds."
+
+        # 9. Single Ed25519 signature
+        signature = sign_manifest(manifest, private_key_pem)
+
+        # 10. Single shared WID — embedded in BOTH audio and video
+        wid = derive_wid(signature, content_id)
+
+        # 11. Shared RS codeword
+        rs_symbols = ReedSolomonCodec(rs_n).encode(wid.data)
+
+        # 11a. Content-adaptive audio segment selection
+        av_scored = scores_from_raw_metrics(av_segment_scores)
+        av_selected = select_best(av_scored, n_needed=rs_n)
+        av_segment_map = SegmentMap(
+            selected_indices=tuple(av_selected),
+            total_segments=n_av_wid_segments,
         )
-    rs_n = min(rs_n_audio, rs_n_video)
+        ap = AudioEmbeddingParams(
+            dwt_levels=ap.dwt_levels,
+            chips_per_bit=ap.chips_per_bit,
+            psychoacoustic=ap.psychoacoustic,
+            safety_margin_db=ap.safety_margin_db,
+            target_snr_db=ap.target_snr_db,
+            target_subband=ap.target_subband,
+            frame_length_ms=ap.frame_length_ms,
+            pn_sequence_length=ap.pn_sequence_length,
+            segment_map=av_segment_map,
+        )
 
-    # 8. Single manifest covering BOTH channels
-    active_signals = [
-        "audio_wid", "audio_fingerprint",
-        "video_wid", "video_fingerprint",
-    ]
-    manifest = CryptographicManifest(
-        content_id=content_id,
-        content_hash_sha256=content_hash,
-        fingerprints_audio=[fp.hash_hex for fp in audio_fingerprints],
-        fingerprints_video=[fp.hash_hex for fp in video_fingerprints],
-        author_id=certificate.author_id,
-        author_public_key=certificate.public_key_pem,
-        created_at=datetime.now(timezone.utc).isoformat(),
-    )
+        # 12. Audio hopping plan
+        band_configs = plan_audio_hopping(
+            rs_n, content_id, certificate.public_key_pem, pepper,
+            force_levels=list(ap.dwt_levels),
+            target_subband=ap.target_subband,
+        )
 
-    # 9. Single Ed25519 signature
-    signature = sign_manifest(manifest, private_key_pem)
+        # Build segment→RS mapping
+        av_selected_set = set(av_segment_map.selected_indices)
+        _av_seg_to_rs = {seg_idx: rs_idx
+                         for rs_idx, seg_idx in enumerate(av_segment_map.selected_indices)}
 
-    # 10. Single shared WID — embedded in BOTH audio and video
-    wid = derive_wid(signature, content_id)
+        # 13. Embed audio — streaming pass
+        # Adaptive bitrate: ≥ source, floor 256k (raised from 192k), ceiling 384k.
+        # For lossless source audio, cap at 384k (PCM-in-MP4 has compatibility issues).
+        output_audio_bitrate = _compute_output_audio_bitrate(
+            profile.audio_bitrate_bps, cap_lossless=True
+        )
 
-    # 11. Shared RS codeword
-    rs_symbols = ReedSolomonCodec(rs_n).encode(wid.data)
+        with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as tmp:
+            audio_signed_path = Path(tmp.name)
 
-    # 11a. Content-adaptive audio segment selection
-    av_scored = scores_from_raw_metrics(av_segment_scores)
-    av_selected = select_best(av_scored, n_needed=rs_n)
-    av_segment_map = SegmentMap(
-        selected_indices=tuple(av_selected),
-        total_segments=n_av_wid_segments,
-    )
-    ap = AudioEmbeddingParams(
-        dwt_levels=ap.dwt_levels,
-        chips_per_bit=ap.chips_per_bit,
-        psychoacoustic=ap.psychoacoustic,
-        safety_margin_db=ap.safety_margin_db,
-        target_snr_db=ap.target_snr_db,
-        target_subband=ap.target_subband,
-        frame_length_ms=ap.frame_length_ms,
-        pn_sequence_length=ap.pn_sequence_length,
-        segment_map=av_segment_map,
-    )
-
-    # 12. Audio hopping plan
-    band_configs = plan_audio_hopping(
-        rs_n, content_id, certificate.public_key_pem, pepper,
-        force_levels=list(ap.dwt_levels),
-        target_subband=ap.target_subband,
-    )
-
-    # Build segment→RS mapping
-    av_selected_set = set(av_segment_map.selected_indices)
-    _av_seg_to_rs = {seg_idx: rs_idx
-                     for rs_idx, seg_idx in enumerate(av_segment_map.selected_indices)}
-
-    # 13. Embed audio — streaming pass
-    # Adaptive bitrate: ≥ source, floor 256k (raised from 192k), ceiling 384k.
-    # For lossless source audio, cap at 384k (PCM-in-MP4 has compatibility issues).
-    output_audio_bitrate = _compute_output_audio_bitrate(
-        profile.audio_bitrate_bps, cap_lossless=True
-    )
-
-    with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as tmp:
-        audio_signed_path = Path(tmp.name)
-
-    encoder_proc = media.encode_audio_stream(
-        sample_rate=target_sample_rate,
-        output_path=audio_signed_path,
-        codec="aac",
-        bitrate=output_audio_bitrate,
-    )
-    try:
-        for seg_idx, chunk, _ in media.iter_audio_segments(
-            media_path, segment_duration_s=2.0, target_sample_rate=target_sample_rate
-        ):
-            if seg_idx in av_selected_set:
-                rs_idx = _av_seg_to_rs[seg_idx]
-                pn_seed = int.from_bytes(
-                    hmac.new(
-                        pepper,
-                        f"wid|{content_id}|{certificate.public_key_pem}|{rs_idx}".encode(),
-                        hashlib.sha256,
-                    ).digest()[:8],
-                    "big",
-                )
-                chunk = embed_audio_segment(
-                    chunk, rs_symbols[rs_idx], band_configs[rs_idx], pn_seed,
-                    chips_per_bit=ap.chips_per_bit,
-                    target_snr_db=ap.target_snr_db,
-                    use_psychoacoustic=ap.psychoacoustic,
-                    safety_margin_db=ap.safety_margin_db,
-                )
+        encoder_proc = media.encode_audio_stream(
+            sample_rate=target_sample_rate,
+            output_path=audio_signed_path,
+            codec="aac",
+            bitrate=output_audio_bitrate,
+        )
+        _av_wid_prefix = f"wid|{content_id}|{certificate.public_key_pem}|".encode()
+        _av_wid_base_hmac = hmac.new(pepper, _av_wid_prefix, hashlib.sha256)
+        try:
+            # Pass 2: stream chunks back from the on-disk scratch — no second
+            # ffmpeg subprocess, and peak RSS is bounded to ~one chunk.
+            for seg_idx, chunk in enumerate(av_scratch):
+                if seg_idx in av_selected_set:
+                    rs_idx = _av_seg_to_rs[seg_idx]
+                    h = _av_wid_base_hmac.copy()
+                    h.update(str(rs_idx).encode())
+                    pn_seed = int.from_bytes(h.digest()[:8], "big")
+                    chunk = embed_audio_segment(
+                        chunk, rs_symbols[rs_idx], band_configs[rs_idx], pn_seed,
+                        chips_per_bit=ap.chips_per_bit,
+                        target_snr_db=ap.target_snr_db,
+                        use_psychoacoustic=ap.psychoacoustic,
+                        safety_margin_db=ap.safety_margin_db,
+                    )
+                if encoder_proc.stdin:
+                    encoder_proc.stdin.write(
+                        (np.clip(chunk, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+                    )
+        finally:
             if encoder_proc.stdin:
-                encoder_proc.stdin.write(
-                    (np.clip(chunk, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
-                )
-    finally:
-        if encoder_proc.stdin:
-            encoder_proc.stdin.close()
-        encoder_proc.wait()
+                encoder_proc.stdin.close()
+            encoder_proc.wait()
 
     # 14. Embed video — streaming encode, one segment at a time
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         video_signed_path = Path(tmp.name)
 
-    av_profile = media.probe(media_path)
-    av_fps = av_profile.fps
-    av_width, av_height = av_profile.width, av_profile.height
+    # Reuse the entry-probe profile — ffprobe is identical for the same file
+    av_fps = profile.fps
+    av_width, av_height = profile.width, profile.height
 
     av_crf_to_use = output_crf if output_crf is not None else _compute_output_video_crf(profile.duration_s)
     video_encoder = media.open_video_encode_stream(av_width, av_height, av_fps, video_signed_path, crf=av_crf_to_use)
@@ -953,7 +1027,10 @@ def _sign_av_cpu(
         ):
             if seg_idx >= rs_n:
                 for frame in seg_frames:
-                    video_encoder.stdin.write(frame_to_yuv420(frame))
+                    y, u, v = frame_to_yuvj420_planes(frame)
+                    video_encoder.stdin.write(y)
+                    video_encoder.stdin.write(u)
+                    video_encoder.stdin.write(v)
                 continue
 
             symbol_bits = np.array(
@@ -962,13 +1039,15 @@ def _sign_av_cpu(
             )
 
             for frame in seg_frames:
-                frame = embed_video_frame(
+                y, u, v = embed_video_frame_yuvj420_planes(
                     frame, symbol_bits, content_id,
                     certificate.public_key_pem, seg_idx, pepper,
                     use_jnd_adaptive=vp.jnd_adaptive,
                     jnd_params=vp,
                 )
-                video_encoder.stdin.write(frame_to_yuv420(frame))
+                video_encoder.stdin.write(y)
+                video_encoder.stdin.write(u)
+                video_encoder.stdin.write(v)
 
     finally:
         if video_encoder.stdin:
