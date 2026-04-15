@@ -102,8 +102,8 @@ video:
     clips:
       - id: "dark_no_audio_01"
         path: "video/without_audio/video_dark_no_audio.mp4"
-        sha256: "d6617a009c0c6c9aebf7398d43cad6d1985ddc1b9ab0479e2ea977362b8af5b0"
-        duration_s: 30.53
+        sha256: "52878cd0c1872f462693f8ac0f9cc47de3b817d3bd5c1016c67fab05e516f928"
+        duration_s: 122.11
         fps: 30.0
         resolution: [1920, 1080]
         has_audio: true        # ffprobe detects an AAC track; name is misleading
