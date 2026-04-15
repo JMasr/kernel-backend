@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from typing import Iterable, Iterator, Sequence
 
 import cv2
 import numpy as np
 from scipy.signal import stft
 
 from kernel_backend.core.domain.watermark import SegmentFingerprint
+
+# A pepper-free intermediate: unit-normalized DCT block (direction only).
+# Pairing with time_offset_ms lets callers project the same features against
+# multiple (key_material, pepper) combinations without redecoding audio.
+SegmentFeature = tuple[int, np.ndarray]
 
 
 def extract_hashes_from_stream(
@@ -25,32 +31,12 @@ def extract_hashes_from_stream(
     This safely handles overlapping windows without loading the entire
     audio file into memory.
     """
-    segment_samples = int(segment_duration_s * sample_rate)
-    hop_samples = int(segment_samples * (1.0 - overlap))
-    if hop_samples <= 0:
-        hop_samples = segment_samples
-
-    fingerprints = []
-    overlap_buffer = np.zeros(0, dtype=np.float32)
-    time_offset_samples = 0
-
-    for chunk in segment_stream:
-        overlap_buffer = np.concatenate((overlap_buffer, chunk))
-        start = 0
-        while start + segment_samples <= len(overlap_buffer):
-            segment = overlap_buffer[start : start + segment_samples]
-            hash_hex = _compute_hash(segment, sample_rate, key_material, pepper,
-                                     f_min=f_min, f_max=f_max)
-            fingerprints.append(SegmentFingerprint(
-                time_offset_ms=int((time_offset_samples + start) * 1000 / sample_rate),
-                hash_hex=hash_hex,
-            ))
-            start += hop_samples
-            
-        overlap_buffer = overlap_buffer[start:]
-        time_offset_samples += start
-
-    return fingerprints
+    features = list(iter_segment_features_from_stream(
+        segment_stream, sample_rate,
+        segment_duration_s=segment_duration_s, overlap=overlap,
+        f_min=f_min, f_max=f_max,
+    ))
+    return project_features_to_fingerprints(features, key_material, pepper)
 
 
 def extract_hashes(
@@ -75,23 +61,150 @@ def extract_hashes(
     Verification uses min(hamming_distance) across all overlapping
     segments — at least one window will be aligned.
     """
+    features = list(iter_segment_features(
+        samples, sample_rate,
+        segment_duration_s=segment_duration_s, overlap=overlap,
+        f_min=f_min, f_max=f_max,
+    ))
+    return project_features_to_fingerprints(features, key_material, pepper)
+
+
+def iter_segment_features_from_stream(
+    segment_stream: Iterable[np.ndarray],
+    sample_rate: int,
+    segment_duration_s: float = 2.0,
+    overlap: float = 0.5,
+    f_min: float = 300.0,
+    f_max: float = 8000.0,
+) -> Iterator[SegmentFeature]:
+    """Yield pepper-free per-segment feature vectors from a chunk stream.
+
+    Pair with `project_features_to_fingerprints` to obtain hashes. Splitting
+    the pipeline lets callers (notably the public verification endpoint)
+    decode + feature-extract once, then project against many org peppers for
+    cheap — the keyed projection is the only pepper-dependent step.
+    """
     segment_samples = int(segment_duration_s * sample_rate)
     hop_samples = int(segment_samples * (1.0 - overlap))
     if hop_samples <= 0:
         hop_samples = segment_samples
 
-    fingerprints = []
+    overlap_buffer = np.zeros(0, dtype=np.float32)
+    time_offset_samples = 0
+
+    for chunk in segment_stream:
+        overlap_buffer = np.concatenate((overlap_buffer, chunk))
+        start = 0
+        while start + segment_samples <= len(overlap_buffer):
+            segment = overlap_buffer[start : start + segment_samples]
+            feature = _compute_features(segment, sample_rate, f_min=f_min, f_max=f_max)
+            yield int((time_offset_samples + start) * 1000 / sample_rate), feature
+            start += hop_samples
+
+        overlap_buffer = overlap_buffer[start:]
+        time_offset_samples += start
+
+
+def iter_segment_features(
+    samples: np.ndarray,
+    sample_rate: int,
+    segment_duration_s: float = 2.0,
+    overlap: float = 0.5,
+    f_min: float = 300.0,
+    f_max: float = 8000.0,
+) -> Iterator[SegmentFeature]:
+    """Buffered counterpart of `iter_segment_features_from_stream`."""
+    segment_samples = int(segment_duration_s * sample_rate)
+    hop_samples = int(segment_samples * (1.0 - overlap))
+    if hop_samples <= 0:
+        hop_samples = segment_samples
+
     start = 0
     while start + segment_samples <= len(samples):
         segment = samples[start : start + segment_samples]
-        hash_hex = _compute_hash(segment, sample_rate, key_material, pepper,
-                                 f_min=f_min, f_max=f_max)
-        fingerprints.append(SegmentFingerprint(
-            time_offset_ms=int(start * 1000 / sample_rate),
-            hash_hex=hash_hex,
-        ))
+        feature = _compute_features(segment, sample_rate, f_min=f_min, f_max=f_max)
+        yield int(start * 1000 / sample_rate), feature
         start += hop_samples
-    return fingerprints
+
+
+def project_features_to_fingerprints(
+    features: Iterable[SegmentFeature],
+    key_material: bytes,
+    pepper: bytes,
+) -> list[SegmentFingerprint]:
+    """Cheap keyed projection: reuse a single projection matrix across segments."""
+    features_list = list(features)
+    if not features_list:
+        return []
+    dimension = features_list[0][1].shape[0]
+    projection = _projection_matrix(key_material, pepper, dimension=dimension)
+
+    result: list[SegmentFingerprint] = []
+    for time_offset_ms, feature in features_list:
+        projected = projection @ feature
+        median = float(np.median(projected))
+        bits = projected >= median
+        value = 0
+        for bit in bits:
+            value = (value << 1) | int(bit)
+        result.append(SegmentFingerprint(
+            time_offset_ms=time_offset_ms,
+            hash_hex=f"{value:016x}",
+        ))
+    return result
+
+
+def project_features_batch(
+    features: Iterable[SegmentFeature],
+    key_materials: Sequence[bytes],
+    peppers: Sequence[bytes],
+) -> list[list[SegmentFingerprint]]:
+    """Project the same pepper-free features against N (key_material, pepper) pairs.
+
+    Returns one fingerprint list per pair, in the same order as the input
+    sequences. The multi-pepper public verify path uses this to replace the
+    per-pepper loop over `project_features_to_fingerprints` with a single 3-D
+    matmul that amortizes the feature matrix over all peppers.
+    """
+    if len(key_materials) != len(peppers):
+        raise ValueError("key_materials and peppers must have the same length")
+
+    features_list = list(features)
+    n_peppers = len(peppers)
+    if n_peppers == 0:
+        return []
+    if not features_list:
+        return [[] for _ in range(n_peppers)]
+
+    dimension = features_list[0][1].shape[0]
+    time_offsets = [t for t, _ in features_list]
+    feature_matrix = np.stack([f for _, f in features_list], axis=1)  # (dim, n_segments)
+
+    projections = np.stack(
+        [_projection_matrix(km, p, dimension=dimension)
+         for km, p in zip(key_materials, peppers)],
+        axis=0,
+    )  # (n_peppers, dim, dim)
+
+    projected = projections @ feature_matrix  # (n_peppers, dim, n_segments)
+
+    medians = np.median(projected, axis=1, keepdims=True)  # (n_peppers, 1, n_segments)
+    bits = (projected >= medians).astype(np.uint64)  # (n_peppers, dim, n_segments)
+
+    powers = (np.uint64(1) << np.arange(dimension - 1, -1, -1, dtype=np.uint64))
+    values = (bits * powers[None, :, None]).sum(axis=1, dtype=np.uint64)  # (n_peppers, n_segments)
+
+    out: list[list[SegmentFingerprint]] = []
+    for pi in range(n_peppers):
+        per_pepper = [
+            SegmentFingerprint(
+                time_offset_ms=time_offsets[si],
+                hash_hex=f"{int(values[pi, si]):016x}",
+            )
+            for si in range(len(time_offsets))
+        ]
+        out.append(per_pepper)
+    return out
 
 
 def hamming_distance(hash_a: str, hash_b: str) -> int:
@@ -115,16 +228,18 @@ def _preemphasis(samples: np.ndarray, coeff: float = 0.97) -> np.ndarray:
     return np.append(samples[0], samples[1:] - coeff * samples[:-1])
 
 
-def _compute_hash(
+def _compute_features(
     segment: np.ndarray,
     sample_rate: int,
-    key_material: bytes,
-    pepper: bytes,
     f_min: float = 300.0,
     f_max: float = 8000.0,
-) -> str:
+) -> np.ndarray:
     """
-    Per-segment hash computation.
+    Pepper-free per-segment feature vector — steps 1–7 of the hash pipeline.
+
+    Returns the unit-normalized 60-dim DCT block (12 freq × 5 time coefficients).
+    The keyed projection + binarization (steps 8–10) run in
+    `project_features_to_fingerprints`.
 
     DCT block shape: 12 frequency coefficients × 5 time coefficients = 60 dims
     Rationale: audio identity is more stable in frequency than in time.
@@ -150,26 +265,14 @@ def _compute_hash(
 
     # 6. Rectangular 12×5 block (freq × time) instead of 8×8
     dct_block = dct[:12, :5]       # 12 freq bins × 5 time bins = 60 values
-    vector = dct_block.flatten()   # 60-dim vector
+    vector = dct_block.flatten().astype(np.float32)
 
     # 7. L2 normalize before projection (preserves direction, not magnitude)
     vector_norm = float(np.linalg.norm(vector))
     if vector_norm > 1e-10:
         vector = vector / vector_norm
 
-    # 8. Keyed projection (60×60 matrix)
-    projection = _projection_matrix(key_material, pepper, dimension=len(vector))
-    projected = projection @ vector
-
-    # 9. Binarize
-    median = float(np.median(projected))
-    bits = projected >= median
-
-    # 10. Pack to hex — 60 bits fits in 16 hex chars (pad to 64 bits)
-    value = 0
-    for bit in bits:
-        value = (value << 1) | int(bit)
-    return f"{value:016x}"
+    return vector
 
 
 def _projection_matrix(

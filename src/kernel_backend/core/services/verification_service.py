@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 from pathlib import Path
+from typing import Iterator, Sequence
 from uuid import UUID
 
 import numpy as np
@@ -31,11 +32,15 @@ from kernel_backend.core.domain.verification import (
 from kernel_backend.core.ports.media import MediaPort
 from kernel_backend.core.ports.registry import RegistryPort
 from kernel_backend.core.ports.storage import StoragePort
-from kernel_backend.core.domain.watermark import SegmentMap, VideoEmbeddingParams
+from kernel_backend.core.domain.watermark import SegmentMap, VideoEmbeddingParams, VideoEntry
 from kernel_backend.core.services.crypto_service import derive_wid, verify_manifest
 from kernel_backend.engine.audio.fingerprint import (
+    SegmentFeature as AudioSegmentFeature,
     extract_hashes as extract_audio_hashes,
     extract_hashes_from_stream as extract_audio_hashes_from_stream,
+    iter_segment_features_from_stream as iter_audio_features_from_stream,
+    project_features_batch as project_audio_features_batch,
+    project_features_to_fingerprints as project_audio_features,
 )
 from kernel_backend.engine.audio.wid_beacon import (
     ERASURE_THRESHOLD_Z,
@@ -45,7 +50,11 @@ from kernel_backend.engine.codec.hopping import plan_audio_hopping
 from kernel_backend.engine.codec.reed_solomon import ReedSolomonCodec, ReedSolomonError
 from kernel_backend.engine.video.fingerprint import (
     SEGMENT_DURATION_S as VIDEO_SEGMENT_S,
+    SegmentFeature as VideoSegmentFeature,
+    extract_features as extract_video_features,
     extract_hashes as extract_video_hashes,
+    project_features_batch as project_video_features_batch,
+    project_features_to_fingerprints as project_video_features,
 )
 from kernel_backend.engine.video.wid_watermark import WID_AGREEMENT_THRESHOLD, extract_segment
 
@@ -71,6 +80,10 @@ class VerificationService:
         registry: RegistryPort,
         pepper: bytes,
         org_id: UUID | None = None,
+        *,
+        audio_features: Sequence[AudioSegmentFeature] | None = None,
+        video_features: Sequence[VideoSegmentFeature] | None = None,
+        precomputed_candidates: Sequence[VideoEntry] | None = None,
     ) -> VerificationResult:
         """
         Two-phase verification pipeline.
@@ -88,8 +101,20 @@ class VerificationService:
             Slow: O(n_segments). Runs only if Phase A found a candidate.
 
         The two phases must not be merged.
+
+        `audio_features` / `video_features` are pepper-free Phase-A features
+        produced by `engine.audio.fingerprint.iter_segment_features_from_stream`
+        / `engine.video.fingerprint.extract_features`. Passing them in lets a
+        caller (notably public multi-pepper verification) decode the media once
+        and reuse the expensive feature extraction across many peppers; the
+        keyed projection is the only pepper-dependent step.
         """
-        candidate = await self._identify_candidate(media_path, media, registry, pepper, org_id)
+        candidate = await self._identify_candidate(
+            media_path, media, registry, pepper, org_id,
+            audio_features=audio_features,
+            video_features=video_features,
+            precomputed_candidates=precomputed_candidates,
+        )
 
         if candidate is None:
             return VerificationResult(
@@ -140,34 +165,58 @@ class VerificationService:
         registry: RegistryPort,
         pepper: bytes,
         org_id: UUID | None = None,
+        *,
+        audio_features: Sequence[AudioSegmentFeature] | None = None,
+        video_features: Sequence[VideoSegmentFeature] | None = None,
+        precomputed_candidates: Sequence[VideoEntry] | None = None,
     ) -> tuple[str, str, float] | None:
         """
         Phase A: fingerprint extraction + registry lookup.
         Returns (content_id, author_public_key, hamming_confidence) | None.
-        """
-        profile = media.probe(media_path)
 
-        # Extract fingerprints appropriate for the media type
+        When `audio_features` / `video_features` are provided, skip feature
+        extraction and project them against `pepper` directly. This is how the
+        public multi-pepper path avoids N× ffmpeg decode + STFT + DCT.
+
+        When `precomputed_candidates` is provided, also skip the registry
+        `match_fingerprints` call — the caller has already resolved candidates
+        via a batched lookup shared across peppers.
+        """
+        if precomputed_candidates is not None:
+            if not precomputed_candidates:
+                return None
+            best_entry = precomputed_candidates[0]
+            return best_entry.content_id, best_entry.author_public_key, 1.0
+
+        # Extract fingerprints appropriate for the media type.
         query_hashes: list[str] = []
 
-        if profile.has_video:
-            video_fps = extract_video_hashes(
-                str(media_path),
-                key_material=pepper,
-                pepper=pepper,
-            )
+        if video_features is not None:
+            video_fps = project_video_features(video_features, pepper, pepper)
             query_hashes = [fp.hash_hex for fp in video_fps]
-        elif profile.has_audio:
-            target_sample_rate = 44100
-            chunk_stream = (chunk for _, chunk, _ in media.iter_audio_segments(
-                media_path, segment_duration_s=2.0, target_sample_rate=target_sample_rate
-            ))
-            audio_fps = extract_audio_hashes_from_stream(
-                chunk_stream, target_sample_rate,
-                key_material=pepper,
-                pepper=pepper,
-            )
+        elif audio_features is not None:
+            audio_fps = project_audio_features(audio_features, pepper, pepper)
             query_hashes = [fp.hash_hex for fp in audio_fps]
+        else:
+            profile = media.probe(media_path)
+            if profile.has_video:
+                video_fps = extract_video_hashes(
+                    str(media_path),
+                    key_material=pepper,
+                    pepper=pepper,
+                )
+                query_hashes = [fp.hash_hex for fp in video_fps]
+            elif profile.has_audio:
+                target_sample_rate = 44100
+                chunk_stream = (chunk for _, chunk, _ in media.iter_audio_segments(
+                    media_path, segment_duration_s=2.0, target_sample_rate=target_sample_rate
+                ))
+                audio_fps = extract_audio_hashes_from_stream(
+                    chunk_stream, target_sample_rate,
+                    key_material=pepper,
+                    pepper=pepper,
+                )
+                query_hashes = [fp.hash_hex for fp in audio_fps]
 
         if not query_hashes:
             return None
@@ -326,14 +375,26 @@ class VerificationService:
         registry: RegistryPort,
         pepper: bytes,
         org_id: UUID | None = None,
+        *,
+        audio_features: Sequence[AudioSegmentFeature] | None = None,
+        audio_chunks: Sequence[np.ndarray] | None = None,
+        precomputed_candidates: Sequence[VideoEntry] | None = None,
     ) -> VerificationResult:
         """
         Audio-only verification pipeline.
 
         Same two-phase structure as verify() but uses audio fingerprints for
-        Phase A and audio WID extraction (DSSS) for Phase B.
+        Phase A and audio WID extraction (DSSS) for Phase B. `audio_features`
+        lets callers pass in pre-computed Phase-A features to avoid a second
+        decode when iterating over multiple peppers. `audio_chunks` carries the
+        raw 2 s 44.1 kHz segments so Phase B skips its own decode pass when the
+        caller already holds them.
         """
-        candidate = await self._identify_candidate(media_path, media, registry, pepper, org_id)
+        candidate = await self._identify_candidate(
+            media_path, media, registry, pepper, org_id,
+            audio_features=audio_features,
+            precomputed_candidates=precomputed_candidates,
+        )
 
         if candidate is None:
             return VerificationResult(
@@ -363,6 +424,7 @@ class VerificationService:
             force_levels=list(_ap.dwt_levels),
             target_subband=_ap.target_subband,
             segment_map=_ap.segment_map,
+            audio_chunks=audio_chunks,
         )
 
         if not decodable:
@@ -432,6 +494,11 @@ class VerificationService:
         registry: RegistryPort,
         pepper: bytes,
         org_id: UUID | None = None,
+        *,
+        audio_features: Sequence[AudioSegmentFeature] | None = None,
+        video_features: Sequence[VideoSegmentFeature] | None = None,
+        audio_chunks: Sequence[np.ndarray] | None = None,
+        precomputed_candidates: Sequence[VideoEntry] | None = None,
     ) -> AVVerificationResult:
         """
         AV verification pipeline.
@@ -452,7 +519,12 @@ class VerificationService:
         media compression), pilot agreement drops below 0.75 threshold. Fingerprints
         drive Phase A; WID + Ed25519 drive Phase B.
         """
-        candidate = await self._identify_candidate(media_path, media, registry, pepper, org_id)
+        candidate = await self._identify_candidate(
+            media_path, media, registry, pepper, org_id,
+            audio_features=audio_features,
+            video_features=video_features,
+            precomputed_candidates=precomputed_candidates,
+        )
 
         if candidate is None:
             return AVVerificationResult(
@@ -478,16 +550,25 @@ class VerificationService:
         stored_wid = derive_wid(entry.manifest_signature, content_id)
         stored_manifest = _manifest_from_json(entry.manifest_json) if entry.manifest_json else None
 
-        # Phase B — extract audio WID
-        _ap_av = entry.embedding_params.audio
-        (audio_wid, audio_decodable,
-         audio_n_seg, audio_n_dec, audio_n_era) = self._extract_audio_wid(
-            media_path, media, content_id, author_public_key, entry.rs_n, pepper,
-            chips_per_bit=_ap_av.chips_per_bit,
-            force_levels=list(_ap_av.dwt_levels),
-            target_subband=_ap_av.target_subband,
-            segment_map=_ap_av.segment_map,
-        )
+        # Phase B — extract audio WID. When the signer fell back to video-only
+        # (e.g. silent audio track), embedding_params.audio is None and no
+        # audio WID was embedded — skip extraction and treat audio as
+        # pass-through in the verdict composition.
+        _ap_av = entry.embedding_params.audio if entry.embedding_params else None
+        if _ap_av is not None:
+            (audio_wid, audio_decodable,
+             audio_n_seg, audio_n_dec, audio_n_era) = self._extract_audio_wid(
+                media_path, media, content_id, author_public_key, entry.rs_n, pepper,
+                chips_per_bit=_ap_av.chips_per_bit,
+                force_levels=list(_ap_av.dwt_levels),
+                target_subband=_ap_av.target_subband,
+                segment_map=_ap_av.segment_map,
+                audio_chunks=audio_chunks,
+            )
+        else:
+            audio_wid = stored_wid.data
+            audio_decodable = True
+            audio_n_seg = audio_n_dec = audio_n_era = 0
 
         # Phase B — extract video WID
         _video_params = entry.embedding_params.video if entry.embedding_params else None
@@ -535,6 +616,142 @@ class VerificationService:
             fingerprint_confidence=confidence,
         )
 
+    async def verify_public(
+        self,
+        media_path: Path,
+        media: MediaPort,
+        storage: StoragePort,
+        registry: RegistryPort,
+        peppers: Sequence[bytes],
+    ) -> VerificationResult | AVVerificationResult:
+        """Public (multi-pepper) verification.
+
+        Decodes the media once, extracts pepper-free Phase-A features once,
+        then iterates `peppers` projecting those features per pepper. Short-
+        circuits on the first pepper that escapes CANDIDATE_NOT_FOUND; if no
+        pepper matches, returns the last attempt so the caller can surface
+        CANDIDATE_NOT_FOUND with the right result type for the media profile.
+
+        This replaces the previous per-pepper `verify_*` loop in the public
+        router, which redid the full ffmpeg-decode + STFT/DCT extraction for
+        every org pepper (5–50× in production).
+        """
+        profile = media.probe(media_path)
+
+        if not profile.has_video and not profile.has_audio:
+            return VerificationResult(
+                verdict=Verdict.RED,
+                red_reason=RedReason.CANDIDATE_NOT_FOUND,
+            )
+
+        # Pepper-free feature extraction — runs exactly once per request.
+        video_features: list[VideoSegmentFeature] | None = None
+        audio_features: list[AudioSegmentFeature] | None = None
+        audio_chunks: list[np.ndarray] | None = None
+
+        if profile.has_video:
+            video_features = extract_video_features(str(media_path))
+        if profile.has_audio:
+            # Retain the decoded 2 s chunks so the matching pepper's Phase B can
+            # run DSSS extraction on the cached audio instead of firing a second
+            # ffmpeg+soundfile decode pass.
+            audio_chunks = []
+
+            def _tee_chunks() -> Iterator[np.ndarray]:
+                for _, chunk, _ in media.iter_audio_segments(
+                    media_path, segment_duration_s=2.0, target_sample_rate=44100,
+                ):
+                    audio_chunks.append(chunk)
+                    yield chunk
+
+            audio_features = list(iter_audio_features_from_stream(_tee_chunks(), 44100))
+
+        # Batched Phase A across every pepper: one tensor matmul for projection
+        # and one prefix-union DB query for the candidate shortlist. Video takes
+        # precedence over audio for candidate lookup — matches the per-pepper
+        # `_identify_candidate` order when both modalities are present.
+        peppers_seq = list(peppers)
+        candidates_per_pepper: list[list[VideoEntry]] = [[] for _ in peppers_seq]
+        if peppers_seq:
+            if profile.has_video and video_features:
+                video_hashes_per_pepper = [
+                    [fp.hash_hex for fp in fps]
+                    for fps in project_video_features_batch(
+                        video_features, peppers_seq, peppers_seq,
+                    )
+                ]
+                candidates_per_pepper = await registry.match_fingerprints_batch(
+                    video_hashes_per_pepper,
+                    max_hamming=_MAX_HAMMING_CANDIDATE,
+                    org_id=None,
+                )
+            elif profile.has_audio and audio_features:
+                audio_hashes_per_pepper = [
+                    [fp.hash_hex for fp in fps]
+                    for fps in project_audio_features_batch(
+                        audio_features, peppers_seq, peppers_seq,
+                    )
+                ]
+                candidates_per_pepper = await registry.match_fingerprints_batch(
+                    audio_hashes_per_pepper,
+                    max_hamming=_MAX_HAMMING_CANDIDATE,
+                    org_id=None,
+                )
+
+        # Default fallback shaped for the media type, so the caller sees
+        # AVVerificationResult for AV inputs even when no pepper matched.
+        last_result: VerificationResult | AVVerificationResult
+        if profile.has_video and profile.has_audio:
+            last_result = AVVerificationResult(
+                verdict=Verdict.RED,
+                audio_verdict=Verdict.RED,
+                video_verdict=Verdict.RED,
+                red_reason=RedReason.CANDIDATE_NOT_FOUND,
+            )
+        else:
+            last_result = VerificationResult(
+                verdict=Verdict.RED,
+                red_reason=RedReason.CANDIDATE_NOT_FOUND,
+            )
+
+        for pepper_idx, pepper in enumerate(peppers_seq):
+            pepper_candidates = candidates_per_pepper[pepper_idx]
+            # Skip peppers whose Phase-A shortlist is empty: we already know
+            # Phase B cannot produce anything but CANDIDATE_NOT_FOUND for them.
+            if not pepper_candidates:
+                continue
+
+            if profile.has_video and profile.has_audio:
+                attempt: VerificationResult | AVVerificationResult = await self.verify_av(
+                    media_path=media_path, media=media, storage=storage,
+                    registry=registry, pepper=pepper, org_id=None,
+                    audio_features=audio_features,
+                    video_features=video_features,
+                    audio_chunks=audio_chunks,
+                    precomputed_candidates=pepper_candidates,
+                )
+            elif profile.has_video:
+                attempt = await self.verify(
+                    media_path=media_path, media=media, storage=storage,
+                    registry=registry, pepper=pepper, org_id=None,
+                    video_features=video_features,
+                    precomputed_candidates=pepper_candidates,
+                )
+            else:
+                attempt = await self.verify_audio(
+                    media_path=media_path, media=media, storage=storage,
+                    registry=registry, pepper=pepper, org_id=None,
+                    audio_features=audio_features,
+                    audio_chunks=audio_chunks,
+                    precomputed_candidates=pepper_candidates,
+                )
+
+            if attempt.red_reason != RedReason.CANDIDATE_NOT_FOUND:
+                return attempt
+            last_result = attempt
+
+        return last_result
+
     def _extract_audio_wid(
         self,
         media_path: Path,
@@ -547,6 +764,8 @@ class VerificationService:
         force_levels: list[int] | None = None,
         target_subband: str = "detail",
         segment_map: SegmentMap | None = None,
+        *,
+        audio_chunks: Sequence[np.ndarray] | None = None,
     ) -> tuple[bytes | None, bool, int, int, int]:
         """
         Extract audio WID via DSSS correlation over each 2-second segment.
@@ -557,6 +776,11 @@ class VerificationService:
         read from entry.embedding_params.audio to reconstruct the exact pipeline
         used at sign time. When segment_map is None (legacy content), falls back
         to sequential 0..rs_n.
+
+        When `audio_chunks` is provided, skip `media.iter_audio_segments` and
+        iterate the cached 2 s, 44.1 kHz chunks in order. The public multi-pepper
+        path uses this to avoid a second ffmpeg+soundfile decode pass in the
+        match branch after Phase A already consumed the audio stream.
         """
         band_configs = plan_audio_hopping(
             rs_n, content_id, author_public_key, pepper,
@@ -582,9 +806,17 @@ class VerificationService:
         n_segments_total = 0
         n_extracted = 0
 
-        for seg_idx, chunk, _ in media.iter_audio_segments(
-            media_path, segment_duration_s=2.0, target_sample_rate=44100
-        ):
+        if audio_chunks is not None:
+            chunk_iter = (
+                (idx, chunk, None)
+                for idx, chunk in enumerate(audio_chunks)
+            )
+        else:
+            chunk_iter = media.iter_audio_segments(
+                media_path, segment_duration_s=2.0, target_sample_rate=44100
+            )
+
+        for seg_idx, chunk, _ in chunk_iter:
             if seg_idx > max_seg:
                 break
 

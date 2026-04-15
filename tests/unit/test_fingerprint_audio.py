@@ -19,7 +19,12 @@ from tests.fixtures.audio_signals import (
     add_babble_noise, add_pink_noise,
     simulate_mp3_compression, simulate_voip_codec,
 )
-from kernel_backend.engine.audio.fingerprint import extract_hashes, hamming_distance
+from kernel_backend.engine.audio.fingerprint import (
+    extract_hashes,
+    hamming_distance,
+    iter_segment_features,
+    project_features_to_fingerprints,
+)
 
 SR = 44100
 DURATION_S = 6.0
@@ -214,3 +219,33 @@ def test_hamming_identical():
     hashes = extract_hashes(white_noise(DURATION_S, SR), SR, KEY_A, PEPPER)
     for fp in hashes:
         assert hamming_distance(fp.hash_hex, fp.hash_hex) == 0
+
+
+def test_split_pipeline_parity():
+    """`project_features(iter_features(...))` must equal `extract_hashes(...)`.
+
+    Guards the Tier 1.1 refactor: the public verification endpoint reuses
+    pepper-free features across many org peppers, so the split pipeline must
+    stay byte-identical to the legacy one-shot call.
+    """
+    sig = white_noise(DURATION_S, SR)
+    legacy = extract_hashes(sig, SR, KEY_A, PEPPER)
+
+    features = list(iter_segment_features(sig, SR))
+    split = project_features_to_fingerprints(features, KEY_A, PEPPER)
+
+    assert len(split) == len(legacy)
+    for a, b in zip(split, legacy):
+        assert a.hash_hex == b.hash_hex
+        assert a.time_offset_ms == b.time_offset_ms
+
+
+def test_features_are_pepper_free():
+    """Same features projected against two peppers must match two separate full extractions."""
+    sig = white_noise(DURATION_S, SR)
+    features = list(iter_segment_features(sig, SR))
+
+    for pepper in (PEPPER, b"another-pepper-exactly-32-bytes!"):
+        expected = extract_hashes(sig, SR, KEY_A, pepper)
+        got = project_features_to_fingerprints(features, KEY_A, pepper)
+        assert [f.hash_hex for f in got] == [f.hash_hex for f in expected]

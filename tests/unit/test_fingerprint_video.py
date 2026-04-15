@@ -9,8 +9,10 @@ import numpy as np
 import pytest
 
 from kernel_backend.engine.video.fingerprint import (
+    extract_features_from_frames,
     extract_hashes_from_frames,
     hamming_distance,
+    project_features_to_fingerprints,
 )
 
 KEY_A = b"author-public-key-material-AAA"
@@ -78,6 +80,36 @@ def test_zero_mean_applied():
     assert h_a[0].hash_hex != h_b[0].hash_hex, (
         "same-brightness frames hash identically — zero-mean may not be applied"
     )
+
+
+def test_split_pipeline_parity():
+    """`project_features(extract_features(...))` must equal `extract_hashes_from_frames(...)`.
+
+    Guards the Tier 1.1 refactor: public verification reuses pepper-free
+    features across every org pepper, so the split must produce identical
+    hashes to the legacy single-shot call.
+    """
+    frames = _random_video_frames()
+    legacy = extract_hashes_from_frames(frames, KEY_A, PEPPER, fps=25.0)
+
+    features = extract_features_from_frames(frames, fps=25.0)
+    split = project_features_to_fingerprints(features, KEY_A, PEPPER)
+
+    assert len(split) == len(legacy)
+    for a, b in zip(split, legacy):
+        assert a.hash_hex == b.hash_hex
+        assert a.time_offset_ms == b.time_offset_ms
+
+
+def test_features_are_pepper_free():
+    """Same cached features + different peppers must match per-pepper full extractions."""
+    frames = _random_video_frames()
+    features = extract_features_from_frames(frames, fps=25.0)
+
+    for pepper in (PEPPER, b"another-pepper-exactly-32-bytes!"):
+        expected = extract_hashes_from_frames(frames, KEY_A, pepper, fps=25.0)
+        got = project_features_to_fingerprints(features, KEY_A, pepper)
+        assert [f.hash_hex for f in got] == [f.hash_hex for f in expected]
 
 
 def test_different_content_discriminated():

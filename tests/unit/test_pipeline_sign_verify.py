@@ -266,6 +266,71 @@ async def test_av_sign_verify_roundtrip(synthetic_av_120s: Path) -> None:
     assert result.video_verdict == Verdict.VERIFIED
 
 
+@pytest.mark.slow
+async def test_verify_public_matches_with_pepper_in_list(synthetic_audio_120s: Path) -> None:
+    """verify_public must find the correct pepper among decoys without re-decoding.
+
+    Guards Tier 1.1: the public multi-pepper path decodes + feature-extracts once
+    and projects those features against each pepper. A matching pepper buried in
+    a list of decoys must still yield VERIFIED; the decoys must not short-circuit
+    past it.
+    """
+    private_pem, public_pem = generate_keypair()
+    cert = _make_cert(public_pem)
+    storage = FakeStorage()
+    registry = FakeRegistry()
+    media = MediaService()
+
+    sign_result = await sign_audio(
+        media_path=synthetic_audio_120s,
+        certificate=cert,
+        private_key_pem=private_pem,
+        storage=storage,
+        registry=registry,
+        pepper=PEPPER,
+        media=media,
+        audio_params=DEFAULT_AUDIO_PARAMS,
+    )
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        signed_path = Path(tmp.name)
+    try:
+        signed_bytes = await storage.get(sign_result.signed_media_key)
+        signed_path.write_bytes(signed_bytes)
+
+        service = VerificationService()
+        decoy_a = b"decoy-pepper-a-exactly-32-bytes!"
+        decoy_b = b"decoy-pepper-b-exactly-32-bytes!"
+        # Correct pepper sandwiched between decoys — worst case for short-circuit.
+        result = await service.verify_public(
+            media_path=signed_path,
+            media=media,
+            storage=storage,
+            registry=registry,
+            peppers=[decoy_a, PEPPER, decoy_b],
+        )
+    finally:
+        signed_path.unlink(missing_ok=True)
+
+    assert result.verdict == Verdict.VERIFIED, (
+        f"Expected VERIFIED but got {result.verdict} (reason={result.red_reason})"
+    )
+
+
+async def test_verify_public_all_decoys_returns_red(synthetic_audio_120s: Path) -> None:
+    """No matching pepper → CANDIDATE_NOT_FOUND result shape for the media type."""
+    service = VerificationService()
+    result = await service.verify_public(
+        media_path=synthetic_audio_120s,
+        media=MediaService(),
+        storage=FakeStorage(),
+        registry=FakeRegistry(),
+        peppers=[b"decoy-a-exactly-32-bytes-padded!", b"decoy-b-exactly-32-bytes-padded!"],
+    )
+    assert result.verdict == Verdict.RED
+    assert result.red_reason == RedReason.CANDIDATE_NOT_FOUND
+
+
 # ── Negative pipeline tests (security invariants) ────────────────────────────
 
 

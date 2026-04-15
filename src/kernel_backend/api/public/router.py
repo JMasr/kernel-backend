@@ -124,35 +124,20 @@ async def verify_public(
         logger.debug("verify/public: file=%s, has_video=%s, has_audio=%s",
                       file.filename, profile.has_video, profile.has_audio)
 
-        # Try every org pepper — wrong peppers fail fast at Phase A (fingerprint matching)
+        # Try every org pepper. verify_public decodes the media and runs the
+        # pepper-free Phase-A feature extraction exactly once, then projects
+        # those features against each pepper (cheap matmul + binarize). This
+        # replaces the earlier per-pepper loop which re-decoded the whole
+        # file N times.
         all_peppers = await _get_all_peppers(request.app.state.db_session_factory)
         logger.debug("verify/public: trying %d peppers", len(all_peppers))
 
-        result = None
-        for idx, pepper in enumerate(all_peppers):
-            if profile.has_video and profile.has_audio:
-                attempt = await service.verify_av(
-                    media_path=tmp_path, media=media, storage=storage,
-                    registry=registry, pepper=pepper, org_id=None,
-                )
-            elif profile.has_video:
-                attempt = await service.verify(
-                    media_path=tmp_path, media=media, storage=storage,
-                    registry=registry, pepper=pepper, org_id=None,
-                )
-            else:
-                attempt = await service.verify_audio(
-                    media_path=tmp_path, media=media, storage=storage,
-                    registry=registry, pepper=pepper, org_id=None,
-                )
-
-            # Any result other than CANDIDATE_NOT_FOUND is authoritative
-            if attempt.red_reason != RedReason.CANDIDATE_NOT_FOUND:
-                logger.info("verify/public: found candidate with pepper #%d", idx + 1)
-                result = attempt
-                break
-
-            result = attempt  # keep last CANDIDATE_NOT_FOUND as fallback
+        result = await service.verify_public(
+            media_path=tmp_path, media=media, storage=storage,
+            registry=registry, peppers=all_peppers,
+        )
+        if result.red_reason != RedReason.CANDIDATE_NOT_FOUND:
+            logger.info("verify/public: candidate found across %d peppers", len(all_peppers))
 
     finally:
         tmp_path.unlink(missing_ok=True)

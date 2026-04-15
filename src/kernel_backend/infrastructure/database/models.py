@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, LargeBinary, String, Text, UniqueConstraint, text
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, LargeBinary, String, Text, UniqueConstraint, event, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.sql import func
@@ -150,8 +150,25 @@ class AudioFingerprint(Base):
     content_id = Column(String, ForeignKey("videos.content_id"), nullable=False, index=True)
     time_offset_ms = Column(Integer, nullable=False)
     hash_hex = Column(String(16), nullable=False)
+    # Top 16 bits of hash_hex, indexed to prefilter Hamming similarity queries
+    # at the database layer instead of scanning the full table into Python.
+    hash_prefix = Column(Integer, nullable=False, index=True)
     is_original = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+@event.listens_for(AudioFingerprint, "before_insert")
+@event.listens_for(AudioFingerprint, "before_update")
+def _audio_fingerprint_autofill_hash_prefix(mapper, connection, target):
+    # Keep hash_prefix consistent with hash_hex automatically so callers that
+    # insert via direct session.add() (tests, one-off scripts, future code) cannot
+    # leave it NULL and silently break the Hamming-prefilter query in
+    # VideoRepository.match_fingerprints, which filters on hash_prefix IN (...).
+    if target.hash_hex and (
+        target.hash_prefix is None
+        or target.hash_prefix != int(target.hash_hex, 16) >> 48
+    ):
+        target.hash_prefix = int(target.hash_hex, 16) >> 48
 
 
 # ---------------------------------------------------------------------------

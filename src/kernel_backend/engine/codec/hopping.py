@@ -34,6 +34,11 @@ def plan_audio_hopping(
     Deterministic: same inputs always produce same output.
     """
     configs: list[BandConfig] = []
+    # Precompute the HMAC with the file-level prefix; per-segment work becomes
+    # a single copy() + update() + digest() instead of a fresh hmac.new each
+    # iteration (saves ~8 µs × n_segments per sign call).
+    prefix = f"audio_hop|{content_id}|{author_pubkey}|".encode()
+    base_hmac = hmac.new(pepper, prefix, hashlib.sha256)
     for i in range(n_segments):
         if force_levels is not None:
             primary = force_levels[0]
@@ -46,8 +51,9 @@ def plan_audio_hopping(
                 target_subband=target_subband,
             ))
         else:
-            msg = f"audio_hop|{content_id}|{author_pubkey}|{i}".encode()
-            digest = hmac.new(pepper, msg, hashlib.sha256).digest()
+            h = base_hmac.copy()
+            h.update(str(i).encode())
+            digest = h.digest()
             seed = int.from_bytes(digest[:8], "big")
             rng = np.random.default_rng(seed)
             dwt_level = int(rng.integers(1, 3))  # 1 or 2
@@ -78,9 +84,12 @@ def plan_video_hopping(
     robust_required = [(0, 1), (1, 0)]
     optional_pool = [(1, 1), (0, 2)]
     configs: list[BandConfig] = []
+    prefix = f"video_hop|{content_id}|{author_pubkey}|".encode()
+    base_hmac = hmac.new(pepper, prefix, hashlib.sha256)
     for i in range(n_segments):
-        msg = f"video_hop|{content_id}|{author_pubkey}|{i}".encode()
-        digest = hmac.new(pepper, msg, hashlib.sha256).digest()
+        h = base_hmac.copy()
+        h.update(str(i).encode())
+        digest = h.digest()
         seed = int.from_bytes(digest[:8], "big")
         rng = np.random.default_rng(seed)
         n_extra = int(rng.integers(1, 3))  # 1 or 2 extra positions
