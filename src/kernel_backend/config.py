@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     SENTRY_DSN: str = ""
     CORS_ORIGINS: list[str] = ["http://localhost:3000"]
 
+    # ARQ worker pool tuning. Defaults match the previous hard-coded values.
+    # SIGN_POOL_MAX_TASKS_PER_CHILD recycles workers after N jobs to cap RSS
+    # growth from numpy/librosa allocator fragmentation.
+    ARQ_MAX_JOBS: int = 4
+    SIGN_POOL_MAX_WORKERS: int = 2
+    SIGN_POOL_MAX_TASKS_PER_CHILD: int = 50
+
     @model_validator(mode="after")
     def _enforce_production_secrets(self) -> "Settings":
         if self.ENV == "production" and self.STORAGE_HMAC_SECRET == _HMAC_SECRET_PLACEHOLDER:
