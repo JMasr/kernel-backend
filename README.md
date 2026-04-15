@@ -19,22 +19,22 @@ without exposing signing secrets.
 
 ## Tech stack
 
-| Layer | Technology |
-|-------|-----------|
-| Framework | FastAPI 0.115 + Uvicorn |
-| Language | Python 3.11 |
-| Package manager | uv (lock-file based) |
-| Database | PostgreSQL via SQLAlchemy 2 async + asyncpg |
-| Migrations | Alembic |
-| Job queue | ARQ 0.26 (async Redis queue, Valkey-compatible) |
-| Object store | boto3 — MinIO locally, Cloudflare R2 in production |
-| Auth | Stack Auth (JWT verification via JWKS) + local admin JWT fallback |
-| Watermarking | Custom engine: spread-spectrum + QIM + Reed-Solomon + psychoacoustic masking |
-| Media processing | ffmpeg-python, librosa, scipy, opencv-headless |
-| Email | Resend |
-| Observability | structlog + Sentry SDK |
-| Testing | pytest-asyncio, hypothesis, custom polygon test suite |
-| Linting | ruff |
+| Layer            | Technology                                                                   |
+|------------------|------------------------------------------------------------------------------|
+| Framework        | FastAPI 0.115 + Uvicorn                                                      |
+| Language         | Python 3.11                                                                  |
+| Package manager  | uv (lock-file based)                                                         |
+| Database         | PostgreSQL via SQLAlchemy 2 async + asyncpg                                  |
+| Migrations       | Alembic                                                                      |
+| Job queue        | ARQ 0.26 (async Redis queue, Valkey-compatible)                              |
+| Object store     | boto3 — MinIO locally, Cloudflare R2 in production                           |
+| Auth             | Stack Auth (JWT verification via JWKS) + local admin JWT fallback            |
+| Watermarking     | Custom engine: spread-spectrum + QIM + Reed-Solomon + psychoacoustic masking |
+| Media processing | ffmpeg-python, librosa, scipy, opencv-headless                               |
+| Email            | Resend                                                                       |
+| Observability    | structlog + Sentry SDK                                                       |
+| Testing          | pytest-asyncio, hypothesis, custom polygon test suite                        |
+| Linting          | ruff                                                                         |
 
 ---
 
