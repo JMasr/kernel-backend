@@ -44,12 +44,16 @@ async def sign(
     certificate_json: str = Form(..., description="Certificate JSON from POST /identity/generate"),
     private_key_pem: str = Form(..., description="Ed25519 private key PEM"),
 ) -> SignJobResponse:
-    """Enqueue a signing job and return immediately with job_id."""
+    """Enqueue a signing job and return immediately with job_id.
+
+    The upload body is streamed to a temp file on the shared ``signing_tmp``
+    volume; probe, normalisation and duration validation all run inside the
+    ARQ worker (``process_sign_job``) so this endpoint returns as soon as the
+    bytes are on disk. Validation failures surface via ``GET /sign/{job_id}``
+    with ``status="failed"`` and a user-facing ``error`` string.
+    """
     logger.debug("sign: received form fields — file=%s, cert_json_len=%d, pkey_len=%d",
                  file.filename, len(certificate_json), len(private_key_pem))
-    content = await file.read()
-    if len(content) > _MAX_BYTES:
-        raise HTTPException(status_code=413, detail="File too large (max 2 GB)")
 
     # Ownership check — cert.author_id must match the authenticated user (JWT only)
     user_id: str | None = getattr(request.state, "user_id", None)
@@ -79,58 +83,24 @@ async def sign(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
+    # Stream the request body to disk in 1 MB chunks. Avoids a 70 MB+ RAM
+    # spike per upload and enforces the size cap without materialising the
+    # full body. On size violation, the partially-written temp file is
+    # unlinked immediately.
+    _CHUNK = 1024 * 1024
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(content)
         media_path = tmp.name
-
-    # Pre-queue duration validation — reject too-short / too-long files immediately
-    normalized_path: str | None = None
-    try:
-        from kernel_backend.infrastructure.media.media_service import MediaService
-        media_svc = MediaService()
-
-        # Normalize non-H.264 video to H.264 MP4 intermediate
-        norm_path, was_transcoded = media_svc.normalize_video_input(Path(media_path))
-        if was_transcoded:
-            normalized_path = str(norm_path)
-            # Clean up original upload, use transcoded file going forward
-            Path(media_path).unlink(missing_ok=True)
-            media_path = normalized_path
-
-        profile = media_svc.probe(Path(media_path))
-        _MIN_VIDEO_DURATION = 85   # 17 segments × 5 s/segment
-        _MIN_AUDIO_DURATION = 34   # 17 segments × 2 s/segment
-        _MAX_DURATION = 3600       # 1 hour
-
-        if profile.duration_s > _MAX_DURATION:
-            raise HTTPException(
-                status_code=422,
-                detail=f"File is too long. Your file is approximately {int(profile.duration_s)} seconds, "
-                       f"but the maximum allowed duration is {_MAX_DURATION} seconds (1 hour).",
-            )
-        if profile.has_video and profile.duration_s < _MIN_VIDEO_DURATION:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Video is too short to sign. Your file is approximately {int(profile.duration_s)} seconds, "
-                       f"but the minimum required duration is {_MIN_VIDEO_DURATION} seconds.",
-            )
-        if profile.has_audio and not profile.has_video and profile.duration_s < _MIN_AUDIO_DURATION:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Audio is too short to sign. Your file is approximately {int(profile.duration_s)} seconds, "
-                       f"but the minimum required duration is {_MIN_AUDIO_DURATION} seconds.",
-            )
-        if not profile.has_audio and not profile.has_video:
-            raise HTTPException(
-                status_code=422,
-                detail="File contains no audio or video streams.",
-            )
-    except HTTPException:
-        raise
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=f"Cannot read media file: {exc}")
-    except Exception as exc:
-        logger.warning("sign: media probe failed (non-fatal): %s", exc)
+        total = 0
+        while True:
+            chunk = await file.read(_CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _MAX_BYTES:
+                tmp.close()
+                Path(media_path).unlink(missing_ok=True)
+                raise HTTPException(status_code=413, detail="File too large (max 2 GB)")
+            tmp.write(chunk)
 
     org_id = getattr(request.state, "org_id", None)
 
