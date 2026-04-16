@@ -15,6 +15,7 @@ def plan_chunks(
     n_workers: int = 4,
     guard_segments: int = 1,
     min_payload_segments: int = 4,
+    total_duration_s: float | None = None,
 ) -> ChunkManifest:
     """Partition `total_segments` payload segments into chunks.
 
@@ -35,6 +36,14 @@ def plan_chunks(
          `guard_lead_segments * segment_duration_s`).
       6. `ChunkManifest.validate_coverage` is invoked before returning so
          the caller always gets a structurally sound plan.
+      7. When `total_duration_s` is supplied, the trailing chunk's
+         `decode_end_s` and `expected_payload_duration_s` are clamped to
+         the actual source length. Real clips almost never have a
+         duration that is an exact multiple of `segment_duration_s`
+         (`extract_video_hashes` uses a ceil-style count, so the last
+         fingerprint represents a partial segment); without this clamp
+         the post-trim duration check in `validate_chunks` is blown by
+         the missing fractional tail.
     """
     if total_segments < 0:
         raise ValueError(f"total_segments must be >= 0, got {total_segments}")
@@ -45,6 +54,11 @@ def plan_chunks(
     if min_payload_segments < 1:
         raise ValueError(
             f"min_payload_segments must be >= 1, got {min_payload_segments}"
+        )
+
+    if total_duration_s is not None and total_duration_s <= 0.0:
+        raise ValueError(
+            f"total_duration_s must be > 0 when provided, got {total_duration_s}"
         )
 
     if total_segments == 0:
@@ -58,6 +72,11 @@ def plan_chunks(
 
     # Rule 2 — single-chunk fallback for very short videos.
     if total_segments < min_payload_segments:
+        single_decode_end = total_segments * segment_duration_s
+        single_payload = total_segments * segment_duration_s
+        if total_duration_s is not None:
+            single_decode_end = min(single_decode_end, total_duration_s)
+            single_payload = min(single_payload, total_duration_s)
         single = ChunkSpec(
             chunk_id=0,
             payload_seg_start=0,
@@ -65,9 +84,9 @@ def plan_chunks(
             guard_lead_segments=0,
             guard_trail_segments=0,
             decode_start_s=0.0,
-            decode_end_s=total_segments * segment_duration_s,
+            decode_end_s=single_decode_end,
             payload_start_s=0.0,
-            expected_payload_duration_s=total_segments * segment_duration_s,
+            expected_payload_duration_s=single_payload,
         )
         manifest = ChunkManifest(
             total_chunks=1,
@@ -108,6 +127,17 @@ def plan_chunks(
         decode_end_s = (seg_end + trail) * segment_duration_s
         payload_start_s = lead * segment_duration_s
         expected_payload_duration_s = payload_len * segment_duration_s
+
+        if is_last and total_duration_s is not None:
+            # Real sources rarely end on a segment boundary; clamp the tail
+            # so the -c copy trim and duration validator match reality.
+            decode_end_s = min(decode_end_s, total_duration_s)
+            payload_span_end_s = min(
+                seg_end * segment_duration_s, total_duration_s
+            )
+            expected_payload_duration_s = max(
+                0.0, payload_span_end_s - seg_start * segment_duration_s
+            )
 
         specs.append(
             ChunkSpec(

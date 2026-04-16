@@ -713,6 +713,7 @@ def _encode_signed_video_chunked(
     height: int,
     fps: float,
     crf: int,
+    duration_s: float,
 ) -> Path | None:
     """Parallel chunked encode. Returns the signed Path, or None when the
     planner collapses to a single chunk and the caller should fall back to
@@ -726,6 +727,7 @@ def _encode_signed_video_chunked(
         n_workers=settings.CHUNK_WORKERS,
         guard_segments=settings.CHUNK_GUARD_SEGMENTS,
         min_payload_segments=settings.CHUNK_MIN_PAYLOAD_SEGMENTS,
+        total_duration_s=duration_s,
     )
     if manifest.total_chunks == 1:
         return None
@@ -875,6 +877,7 @@ def _sign_video_cpu(
         height=height,
         fps=fps,
         crf=crf_to_use,
+        duration_s=profile.duration_s,
     )
     if signed_path is None:
         signed_path = _encode_signed_video_sequential(
@@ -1171,6 +1174,7 @@ def _sign_av_cpu(
         height=av_height,
         fps=av_fps,
         crf=av_crf_to_use,
+        duration_s=profile.duration_s,
     )
     if video_signed_path is None:
         video_signed_path = _encode_signed_video_sequential(
