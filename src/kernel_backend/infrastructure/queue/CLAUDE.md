@@ -16,13 +16,32 @@ Blocking the event loop will starve all other jobs and requests.
 async def process_sign_job(ctx: dict, content_id: str, input_path: str):
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(
-        ctx["process_pool"],   # ProcessPoolExecutor passed via WorkerSettings.ctx
+        ctx["process_pool"],   # outer ProcessPoolExecutor passed via WorkerSettings.ctx
         _sign_cpu_work,        # top-level function (picklable)
         content_id,
         input_path,
     )
     return result
 ```
+
+**Nested ProcessPoolExecutor for chunked video encode.**
+Inside the outer pool's child process, `_sign_video_cpu` / `_sign_av_cpu` may
+create a *second* `ProcessPoolExecutor(max_workers=CHUNK_WORKERS)` for the
+parallel encode stage (`core/services/chunk_worker.py`). Linux fork makes this
+safe; the codebase never calls `multiprocessing.set_start_method`. The chunked
+path runs only when `chunk_planner.plan_chunks` returns more than one chunk —
+short videos fall through to the existing sequential encode loop.
+
+```
+ARQ async loop
+   └── outer ProcessPoolExecutor(SIGN_POOL_MAX_WORKERS, default 2)
+         └── _sign_sync()                          ← CPU phase
+              └── inner ProcessPoolExecutor(CHUNK_WORKERS, default 4)
+                    └── process_video_chunk() × N  ← parallel ffmpeg+libx264
+```
+
+Pool children are recycled after `SIGN_POOL_MAX_TASKS_PER_CHILD` jobs (default
+50) to bound RSS growth from cv2 / ffmpeg-python long-lived state.
 
 **Jobs must be idempotent.**
 ARQ requeues jobs if a worker dies mid-execution. The sign job must be safe
@@ -98,13 +117,37 @@ Use the TCP/TLS endpoint — NOT the REST API endpoint.
 
 ```python
 class WorkerSettings:
-    functions    = [process_sign_job]
-    redis_settings = REDIS_SETTINGS
-    job_timeout  = 180        # 3 min — covers 150 MB video worst case
-    max_jobs     = 4          # concurrent jobs per worker process
-    retry_jobs   = True
-    ctx          = {}         # populated in on_startup
+    functions                 = [process_sign_job, health_check_job]
+    redis_settings            = make_redis_settings(_settings)
+    job_timeout               = 360                       # 6 min — covers large video signing
+    graceful_shutdown_timeout = 360                       # must be <= compose stop_grace_period (380)
+    max_jobs                  = _settings.ARQ_MAX_JOBS    # concurrent jobs per worker process
+    keep_result               = 3600                      # 1 h
+    cron_jobs                 = [cron(cleanup_signing_tmp, minute={0, 30}, run_at_startup=True)]
 ```
+
+`on_startup` builds `ctx["process_pool"] =
+ProcessPoolExecutor(SIGN_POOL_MAX_WORKERS, max_tasks_per_child=
+SIGN_POOL_MAX_TASKS_PER_CHILD)`; this is the *outer* pool. The inner chunk pool
+is created lazily inside the child by `signing_service` only when chunked encode
+fires.
+
+## Tuning recommendation
+
+The recommended layout for an 8 vCPU host (see `.env.example`):
+
+| Setting | Value | Effect |
+|---------|-------|--------|
+| `ARQ_MAX_JOBS` | 2 | Up to 2 concurrent jobs per worker container |
+| `SIGN_POOL_MAX_WORKERS` | 1 | One CPU-bound `_sign_sync` slot per ARQ slot |
+| `SIGN_POOL_MAX_TASKS_PER_CHILD` | 50 | Recycle child to bound RSS |
+| `CHUNK_WORKERS` | 4 | Inner pool fans out video encode across 4 cores |
+| `CHUNK_GUARD_SEGMENTS` | 1 | One segment of warmup context per chunk boundary |
+| `CHUNK_MIN_PAYLOAD_SEGMENTS` | 4 | Below this, fall through to sequential encode |
+
+A single video sign saturates 8 cores (4 chunks × ffmpeg + libx264). Two
+concurrent jobs over-subscribe but the kernel scheduler handles it; lower
+`CHUNK_WORKERS` if you want strict isolation.
 
 ## Validation
 

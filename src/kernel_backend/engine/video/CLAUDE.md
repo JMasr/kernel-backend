@@ -55,11 +55,30 @@ This makes block selection resolution-independent — same content_id works at a
 | Constant | Value | Target | Survives |
 |---|---|---|---|
 | `QIM_STEP_PILOT` | 28.0 | DC coefficient `(0,0)` | H.264 CRF ≤ 28 |
-| `QIM_STEP_WID` | **48.0** | AC coefficients `{(0,1),(1,0),(1,1),(0,2)}` | H.264 CRF ≤ 28 |
+| `QIM_STEP_WID` | **48.0** | AC coefficients `{(0,1),(1,0),(1,1),(0,2)}` (JND-disabled fallback / tests) | H.264 CRF ≤ 28 |
+| `qim_step_base` | **64.0** | AC coefficients, JND-adaptive base used in production | H.264 CRF ≤ 28 |
+| `qim_step_min` / `qim_step_max` | 44.0 / 128.0 | Adaptive step bounds | — |
+
+Production passes JND parameters from `engine/video/algorithm_router.py` (per
+content routing: speech / music / silence / dark) via `VideoEmbeddingParams`.
+The router boosts `qim_step_base` to 80.0 for dark scenes (low-luma masking is
+weak) and uses 56.0 / 72.0 mixes for speech-vs-music routing. The non-adaptive
+`QIM_STEP_WID = 48.0` is reserved for tests and the JND-disabled embed path.
 
 CRF 35 pilot is xfail (informational), but passed unexpectedly (xpassed) on noise-enriched synthetic video — the noise source adds energy to AC coefficients that benefits pilot survival too.
 QIM_STEP_PILOT was calibrated iteratively: 12→20→24→28.
 QIM_STEP_WID was calibrated iteratively: 8.0→64.0→48.0. 8.0 caused quantization grid capture at H.264 QP≈28. 64.0 caused visible 4×4 block artifacts; 48.0 reduces visibility while maintaining CRF 28 robustness via majority voting (12,800 votes/bit).
+
+## Chunked encode — keyframe pinning
+
+When `signing_service` runs the chunked encode path (`core/services/chunk_worker.py`),
+each worker drives `MediaService.open_video_encode_stream(..., force_keyframes_every_s=VIDEO_SEGMENT_S)`,
+which adds `-force_key_frames expr:gte(t,n_forced*5)` to libx264. Every 5s
+segment boundary is therefore guaranteed to be a keyframe so the post-encode
+trim with `ffmpeg -ss … -t … -c copy` lands on the exact segment. The sequential
+encode path leaves the kwarg `None` and uses libx264's default GOP — embedding
+math, hopping, and per-frame helpers (`embed_video_frame_yuvj420_planes`,
+`frame_to_yuvj420_planes`) are reused unchanged by both paths.
 
 ## write_video_frames pixel format — critical
 
