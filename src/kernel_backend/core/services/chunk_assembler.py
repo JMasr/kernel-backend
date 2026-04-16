@@ -13,11 +13,19 @@ from kernel_backend.core.domain.chunk import (
     ChunkValidation,
 )
 
-# Tolerance windows (seconds) for probe-vs-expected duration drift. FFmpeg's
-# trim with -c copy can round to the closest keyframe, so a small slack is
-# expected even for a valid chunk.
-_PER_CHUNK_DURATION_TOL_S = 0.5
-_TOTAL_DURATION_TOL_S = 1.0
+# Tolerance windows (seconds) for probe-vs-expected duration drift. Two things
+# eat into a chunk's final duration:
+#   1. `-c copy` trim rounds to the closest keyframe (bounded by one GOP ≈
+#      segment_duration_s).
+#   2. When the source's total length isn't an exact multiple of
+#      segment_duration_s, the trailing chunk encodes a partial GOP that
+#      stream-copy frequently drops (we've seen ~0.5s loss on real AV clips).
+# The previous 0.5s/1.0s limits were tuned to synthetic clips whose duration
+# was a clean multiple of 5s and turned out to be too tight for arbitrary
+# sources. Genuine catastrophic drops (entire chunks missing, empty output,
+# etc.) are already caught by the dedicated presence / size checks below.
+_PER_CHUNK_DURATION_TOL_S = 1.5
+_TOTAL_DURATION_TOL_S = 3.0
 
 
 def validate_chunks(

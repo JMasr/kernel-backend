@@ -136,3 +136,60 @@ def test_zero_segments_returns_empty_manifest() -> None:
     assert manifest.total_chunks == 0
     assert manifest.chunks == ()
     manifest.validate_coverage()
+
+
+def test_total_duration_s_clamps_last_chunk() -> None:
+    # 206.165s speech clip: 42 fingerprints (ceil), 4 workers, 1-seg guards.
+    # Chunks: [11, 11, 10, 10]. Without clamp the last chunk expects 50s of
+    # payload (seg 32..42 × 5s = 50s), but only 206.165 - 160 = 46.165s of
+    # source exists past the chunk-3 payload start at 160s.
+    manifest = plan_chunks(
+        total_segments=42,
+        segment_duration_s=5.0,
+        n_workers=4,
+        guard_segments=1,
+        min_payload_segments=4,
+        total_duration_s=206.165,
+    )
+    assert manifest.total_chunks == 4
+
+    # Earlier chunks stay on whole-segment math.
+    for chunk in manifest.chunks[:-1]:
+        assert chunk.expected_payload_duration_s == chunk.n_payload_segments * 5.0
+
+    last = manifest.chunks[-1]
+    # decode_end_s clamped to source length.
+    assert last.decode_end_s == pytest.approx(206.165)
+    # payload span ends at EOF: 206.165 - seg_start*5 = 206.165 - 160.0 = 46.165s.
+    assert last.expected_payload_duration_s == pytest.approx(46.165, abs=1e-6)
+
+
+def test_total_duration_s_clamps_single_chunk_fallback() -> None:
+    manifest = plan_chunks(
+        total_segments=3,
+        n_workers=4,
+        min_payload_segments=4,
+        total_duration_s=12.3,
+    )
+    assert manifest.total_chunks == 1
+    only = manifest.chunks[0]
+    assert only.decode_end_s == pytest.approx(12.3)
+    assert only.expected_payload_duration_s == pytest.approx(12.3)
+
+
+def test_total_duration_s_no_op_when_exact_multiple() -> None:
+    with_dur = plan_chunks(
+        total_segments=60, n_workers=4, guard_segments=1,
+        total_duration_s=300.0,
+    )
+    without = plan_chunks(
+        total_segments=60, n_workers=4, guard_segments=1,
+    )
+    assert with_dur == without
+
+
+def test_total_duration_s_rejects_nonpositive() -> None:
+    with pytest.raises(ValueError, match="total_duration_s"):
+        plan_chunks(total_segments=40, n_workers=4, total_duration_s=0.0)
+    with pytest.raises(ValueError, match="total_duration_s"):
+        plan_chunks(total_segments=40, n_workers=4, total_duration_s=-1.0)
