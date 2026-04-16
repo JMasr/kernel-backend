@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import UUID
 
 from kernel_backend.core.domain.identity import Certificate
+from kernel_backend.core.domain.media import MediaProfile
 from kernel_backend.core.services.signing_service import (
     _persist_payload,
     _sign_audio_cpu,
@@ -18,6 +19,13 @@ from kernel_backend.core.services.signing_service import (
 )
 from kernel_backend.infrastructure.media.media_service import MediaService
 
+# Duration bounds moved from POST /sign — keeping them here keeps the
+# worker self-sufficient for Phase 2 (presigned direct-to-S3 uploads) where
+# the API no longer sees the bytes.
+_MIN_VIDEO_DURATION = 85   # 17 segments × 5 s/segment
+_MIN_AUDIO_DURATION = 34   # 17 segments × 2 s/segment
+_MAX_DURATION = 3600       # 1 hour
+
 
 async def _set_job_status(redis: object, job_id: str, status: dict) -> None:
     """Write job status to Redis key job:{job_id}:status with 1-hour TTL."""
@@ -26,6 +34,56 @@ async def _set_job_status(redis: object, job_id: str, status: dict) -> None:
         json.dumps(status),
         ex=3600,
     )
+
+
+async def _validate_local_media(media_path: str) -> tuple[str, MediaProfile]:
+    """Normalize, probe, and duration-check a local media file.
+
+    Blocks on ffmpeg subprocesses, so both calls are pushed onto the default
+    thread pool to keep the ARQ event loop free for other jobs. Raises
+    ``ValueError`` with a user-facing message on any validation failure —
+    ``process_sign_job``'s exception handler persists ``str(exc)`` to the Redis
+    job-status key, and the frontend surfaces it via ``GET /sign/{job_id}``.
+
+    Returns ``(possibly-rewritten media_path, MediaProfile)``. When the file is
+    transcoded the original upload is unlinked; the caller becomes responsible
+    for the returned path.
+
+    Phase 2 note: a sibling ``_validate_s3_media(bucket_key)`` will slot in for
+    presigned direct-to-S3 uploads without changing ``process_sign_job``.
+    """
+    loop = asyncio.get_event_loop()
+    media_svc = MediaService()
+    src = Path(media_path)
+
+    norm_path, was_transcoded = await loop.run_in_executor(
+        None, media_svc.normalize_video_input, src
+    )
+    final_path = norm_path
+    if was_transcoded and src != norm_path:
+        src.unlink(missing_ok=True)
+
+    profile = await loop.run_in_executor(None, media_svc.probe, final_path)
+
+    if profile.duration_s > _MAX_DURATION:
+        raise ValueError(
+            f"File is too long. Your file is approximately {int(profile.duration_s)} seconds, "
+            f"but the maximum allowed duration is {_MAX_DURATION} seconds (1 hour)."
+        )
+    if profile.has_video and profile.duration_s < _MIN_VIDEO_DURATION:
+        raise ValueError(
+            f"Video is too short to sign. Your file is approximately {int(profile.duration_s)} seconds, "
+            f"but the minimum required duration is {_MIN_VIDEO_DURATION} seconds."
+        )
+    if profile.has_audio and not profile.has_video and profile.duration_s < _MIN_AUDIO_DURATION:
+        raise ValueError(
+            f"Audio is too short to sign. Your file is approximately {int(profile.duration_s)} seconds, "
+            f"but the minimum required duration is {_MIN_AUDIO_DURATION} seconds."
+        )
+    if not profile.has_audio and not profile.has_video:
+        raise ValueError("File contains no audio or video streams.")
+
+    return str(final_path), profile
 
 
 def _sign_sync(
@@ -116,6 +174,13 @@ async def process_sign_job(
                 "job_id": arq_job_id, "status": "processing", "progress": 0,
             })
 
+        # Validation phase — probe + normalize + duration checks. These used
+        # to run synchronously in POST /sign, blocking the 202 response while
+        # ffmpeg transcoded non-H.264 inputs (30–120 s for large videos).
+        # Running them here lets the API return as soon as bytes are on disk;
+        # ValueError messages are persisted verbatim by the outer except block.
+        media_path, profile = await _validate_local_media(media_path)
+
         if process_pool is not None:
             # Progress: 20% — about to start CPU work in subprocess
             if redis is not None:
@@ -152,10 +217,9 @@ async def process_sign_job(
                     "job_id": arq_job_id, "status": "processing", "progress": 20,
                 })
 
-            # Fallback: run in-process (dev / no process pool)
-            # Routes to the correct signing function based on media type.
+            # Fallback: run in-process (dev / no process pool).
+            # Route on the profile already computed in _validate_local_media.
             media_svc = MediaService()
-            profile = media_svc.probe(Path(media_path))
 
             if profile.has_video and profile.has_audio:
                 signing_result = await sign_av(
