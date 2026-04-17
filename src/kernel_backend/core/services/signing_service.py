@@ -5,6 +5,7 @@ import concurrent.futures
 import hashlib
 import hmac
 import json
+import logging
 import shutil
 import tempfile
 from collections.abc import Iterator
@@ -16,6 +17,8 @@ from uuid import UUID, uuid4
 import numpy as np
 
 from kernel_backend.config import get_settings
+
+logger = logging.getLogger("kernel.signing_service")
 from kernel_backend.core.domain.chunk import ChunkResult
 from kernel_backend.core.domain.dsp_manifest import PRODUCTION_MANIFEST as _M
 from kernel_backend.core.domain.identity import Certificate
@@ -432,6 +435,10 @@ def _sign_audio_cpu(
         profile = media.probe(media_path)
     if profile.container_type == "video_only":
         raise ValueError("Container has no audio track — cannot sign audio-only pipeline")
+    logger.info(
+        "sign.audio.enter",
+        extra={"duration_s": round(profile.duration_s, 2), "container": profile.container_type},
+    )
 
     # 1b. Content profiling + adaptive routing (unless caller supplied explicit params)
     routing_meta: dict | None = None
@@ -802,6 +809,10 @@ def _sign_video_cpu(
         profile = media.probe(media_path)
     if not profile.has_video:
         raise ValueError("Container has no video track — cannot sign video-only pipeline")
+    logger.info(
+        "sign.video.enter",
+        extra={"duration_s": round(profile.duration_s, 2), "has_audio": profile.has_audio},
+    )
 
     # 1b. Video content profiling + adaptive routing
     video_routing_meta: dict | None = None
@@ -954,6 +965,7 @@ def _sign_av_cpu(
             "sign_av requires both audio and video tracks. "
             f"has_video={profile.has_video}, has_audio={profile.has_audio}"
         )
+    logger.info("sign.av.enter", extra={"duration_s": round(profile.duration_s, 2)})
 
     # 1b. Content profiling + adaptive routing for audio track
     audio_routing_meta: dict | None = None

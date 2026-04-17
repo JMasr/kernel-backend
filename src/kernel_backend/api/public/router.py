@@ -63,7 +63,9 @@ async def _get_all_peppers(session_factory) -> list[bytes]:
                 if pepper_hex:
                     peppers.append(bytes.fromhex(pepper_hex))
     except Exception:
-        pass
+        # Public verify must degrade to the system pepper on DB failure so at
+        # least content signed without an org pepper still verifies.
+        logger.warning("public.verify.pepper_listing_failed", exc_info=True)
     # Always include system default as fallback (content signed without org pepper)
     if _SYSTEM_PEPPER not in peppers:
         peppers.append(_SYSTEM_PEPPER)

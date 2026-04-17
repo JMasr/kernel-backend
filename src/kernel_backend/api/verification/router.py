@@ -22,7 +22,12 @@ _FALLBACK_PEPPER = _settings.system_pepper_bytes
 
 
 async def _resolve_pepper(org_id, session_factory) -> bytes:
-    """Return org.pepper_v1 bytes if set, else fall back to system pepper."""
+    """Return org.pepper_v1 bytes if set, else fall back to system pepper.
+
+    If the directory lookup raises we log and fall back: verification must
+    still run with the system pepper, otherwise a transient DB hiccup would
+    blanket-fail all verify requests for signed-with-system-pepper content.
+    """
     if org_id is None or session_factory is None:
         return _FALLBACK_PEPPER
     try:
@@ -33,7 +38,7 @@ async def _resolve_pepper(org_id, session_factory) -> bytes:
             if org and org.pepper_v1:
                 return bytes.fromhex(org.pepper_v1)
     except Exception:
-        pass
+        logger.warning("verify.pepper_lookup_failed", extra={"org_id": str(org_id)}, exc_info=True)
     return _FALLBACK_PEPPER
 _MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
