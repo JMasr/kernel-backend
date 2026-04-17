@@ -15,10 +15,13 @@ RULES: dict[str, set[str]] = {
         "fastapi", "starlette", "sqlalchemy", "alembic",
         "arq", "boto3", "botocore", "ffmpeg", "cv2", "pywt",
         "soundfile", "aiofiles",
+        # Logging configuration is infra-owned; core/engine use stdlib logging only.
+        "structlog", "sentry_sdk",
     },
     "src/kernel_backend/engine": {
         "fastapi", "starlette", "sqlalchemy", "alembic",
         "arq", "boto3", "botocore", "ffmpeg",
+        "structlog", "sentry_sdk",
     },
 }
 

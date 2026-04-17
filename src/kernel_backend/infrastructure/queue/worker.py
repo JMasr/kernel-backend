@@ -8,6 +8,7 @@ from arq import cron
 from kernel_backend.config import Settings
 from kernel_backend.infrastructure.database.repositories import SessionFactoryRegistry
 from kernel_backend.infrastructure.database.session import make_engine, make_session_factory
+from kernel_backend.infrastructure.logging import configure_logging
 from kernel_backend.infrastructure.queue.cleanup_job import cleanup_signing_tmp
 from kernel_backend.infrastructure.queue.health_job import health_check_job
 from kernel_backend.infrastructure.queue.jobs import process_sign_job
@@ -19,6 +20,7 @@ from kernel_backend.infrastructure.storage import make_storage
 async def on_startup(ctx: dict) -> None:
     """Populate ctx with the dependencies that job functions expect."""
     settings = Settings()
+    configure_logging(settings)
 
     engine = make_engine(settings.DATABASE_URL)
     session_factory = make_session_factory(engine)

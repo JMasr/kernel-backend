@@ -12,14 +12,26 @@ import hashlib
 import logging
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
 import jwt
+import structlog
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 _log = logging.getLogger("kernel.auth")
+
+
+def _bind_auth(*, auth_type: str, user_id: str | None, org_id: Any, is_admin: bool) -> None:
+    """Merge resolved auth identity into the ambient structlog context."""
+    structlog.contextvars.bind_contextvars(
+        auth_type=auth_type,
+        user_id=user_id,
+        org_id=str(org_id) if org_id is not None else None,
+        is_admin=is_admin,
+    )
 
 # Paths that do not require any authentication
 _PUBLIC_PATHS = {
@@ -111,6 +123,7 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
                 repo = OrganizationRepository(session)
                 api_key = await repo.verify_api_key(key_hash)
         except Exception:
+            _log.exception("auth.api_key_lookup_failed")
             return JSONResponse(
                 status_code=500,
                 content={"detail": "Authentication service unavailable"},
@@ -126,6 +139,12 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
         request.state.auth_type = "api_key"
         request.state.user_id = None
         request.state.is_admin = False
+        _bind_auth(
+            auth_type="api_key",
+            user_id=None,
+            org_id=api_key.org_id,
+            is_admin=False,
+        )
         return await call_next(request)
 
 
@@ -157,6 +176,7 @@ class HybridAuthMiddleware(BaseHTTPMiddleware):
             request.state.auth_type = "public"
             request.state.user_id = None
             request.state.is_admin = False
+            _bind_auth(auth_type="public", user_id=None, org_id=None, is_admin=False)
             return await call_next(request)
 
         auth_header = request.headers.get("Authorization", "")
@@ -167,11 +187,10 @@ class HybridAuthMiddleware(BaseHTTPMiddleware):
             )
 
         token = auth_header[len("Bearer "):]
-        token_preview = f"{token[:12]}..." if len(token) > 12 else token
 
         try:
             if token.startswith("krnl_"):
-                _log.debug("auth: API key path  token=%s", token_preview)
+                _log.debug("auth.route", extra={"scheme": "api_key"})
                 await self._handle_api_key(token, request)
             else:
                 # Smart routing: inspect JWT header to decide path
@@ -181,17 +200,25 @@ class HybridAuthMiddleware(BaseHTTPMiddleware):
                 token_alg = self._get_token_alg(token)
 
                 if token_alg == "HS256" and settings.JWT_SECRET:
-                    _log.debug("auth: local JWT path (HS256)  token=%s", token_preview)
+                    _log.debug("auth.route", extra={"scheme": "local_jwt", "alg": "HS256"})
                     await self._handle_local_jwt(token, request, settings)
                 else:
-                    _log.debug("auth: Stack Auth path (alg=%s)  token=%s",
-                               token_alg or "unknown", token_preview)
+                    _log.debug(
+                        "auth.route",
+                        extra={"scheme": "neon_auth", "alg": token_alg or "unknown"},
+                    )
                     await self._handle_neon_auth(token, request)
         except _AuthError as exc:
-            _log.warning("auth: rejected  path=%s  reason=%s", request.url.path, exc)
+            _log.warning(
+                "auth.rejected",
+                extra={"path": request.url.path, "reason": str(exc)},
+            )
             return JSONResponse(status_code=401, content={"detail": str(exc)})
-        except Exception as exc:
-            _log.exception("auth: unexpected error  path=%s  error=%s", request.url.path, exc)
+        except Exception:
+            _log.exception(
+                "auth.unexpected_error",
+                extra={"path": request.url.path},
+            )
             return JSONResponse(
                 status_code=500,
                 content={"detail": "Authentication service unavailable"},
@@ -260,6 +287,12 @@ class HybridAuthMiddleware(BaseHTTPMiddleware):
         request.state.user_id = email
         request.state.email = email
         request.state.is_admin = is_admin
+        _bind_auth(
+            auth_type="local_jwt",
+            user_id=email,
+            org_id=org.id if org else None,
+            is_admin=is_admin,
+        )
 
     async def _handle_api_key(self, token: str, request: Request) -> None:
         key_hash = hashlib.sha256(token.encode()).hexdigest()
@@ -280,6 +313,12 @@ class HybridAuthMiddleware(BaseHTTPMiddleware):
         request.state.user_id = None
         request.state.email = None
         request.state.is_admin = False
+        _bind_auth(
+            auth_type="api_key",
+            user_id=None,
+            org_id=api_key.org_id,
+            is_admin=False,
+        )
 
     async def _handle_neon_auth(self, token: str, request: Request) -> None:
         """
@@ -292,12 +331,18 @@ class HybridAuthMiddleware(BaseHTTPMiddleware):
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         cached = _cache_get(token_hash)
         if cached is not None:
-            _log.debug("Stack Auth: cache hit  user_id=%s", cached.user_id)
+            _log.debug("auth.cache_hit", extra={"user_id": cached.user_id})
             request.state.org_id = cached.org_id
             request.state.auth_type = "neon_auth"
             request.state.user_id = cached.user_id
             request.state.email = cached.email
             request.state.is_admin = cached.is_admin
+            _bind_auth(
+                auth_type="neon_auth",
+                user_id=cached.user_id,
+                org_id=cached.org_id,
+                is_admin=cached.is_admin,
+            )
             return
 
         # --- Settings ---
@@ -406,6 +451,12 @@ class HybridAuthMiddleware(BaseHTTPMiddleware):
         request.state.auth_type = "neon_auth"
         request.state.user_id = user_id
         request.state.is_admin = is_admin
+        _bind_auth(
+            auth_type="neon_auth",
+            user_id=user_id,
+            org_id=org_id,
+            is_admin=is_admin,
+        )
 
         # --- Cache populate (skip bootstrap case — org will be created next request) ---
         if not (org_id is None and is_admin):

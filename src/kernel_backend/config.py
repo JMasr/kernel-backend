@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     S3_REGION: str = "auto"
     ENV: Literal["development", "production"] = "development"
     LOG_LEVEL: str = "INFO"
+    LOG_FORMAT: Literal["json", "console"] = "json"
     SENTRY_DSN: str = ""
     CORS_ORIGINS: list[str] = ["http://localhost:3000"]
 

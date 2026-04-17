@@ -60,7 +60,9 @@ async def get_me(request: Request) -> MeResponse:
                 if org:
                     org_name = org.name
         except Exception:
-            pass
+            # Degrade gracefully — the profile endpoint must return even if
+            # the org directory lookup momentarily fails.
+            _log.warning("me.org_lookup_failed", extra={"org_id": str(org_id)}, exc_info=True)
 
     # Check if user has an Ed25519 key pair (author_id == user_id after Phase B.1)
     has_key_pair = False
@@ -70,7 +72,7 @@ async def get_me(request: Request) -> MeResponse:
             cert = await identity_repo.get_by_author_id(user_id)
             has_key_pair = cert is not None
     except Exception:
-        pass
+        _log.warning("me.identity_lookup_failed", extra={"user_id": user_id}, exc_info=True)
 
     response = MeResponse(
         user_id=user_id,

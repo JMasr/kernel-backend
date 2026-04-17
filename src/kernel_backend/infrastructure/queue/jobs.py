@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from uuid import UUID
+
+import structlog
 
 from kernel_backend.core.domain.identity import Certificate
 from kernel_backend.core.domain.media import MediaProfile
@@ -17,7 +20,10 @@ from kernel_backend.core.services.signing_service import (
     sign_av,
     sign_video,
 )
+from kernel_backend.infrastructure.logging import configure_logging, get_logger
 from kernel_backend.infrastructure.media.media_service import MediaService
+
+logger = get_logger("kernel.job.sign")
 
 # Duration bounds moved from POST /sign — keeping them here keeps the
 # worker self-sufficient for Phase 2 (presigned direct-to-S3 uploads) where
@@ -93,6 +99,7 @@ def _sign_sync(
     pepper: bytes,
     org_id: str | None = None,
     original_filename: str = "",
+    trace_ctx: dict | None = None,
 ) -> dict:
     """Top-level picklable function — runs the CPU phase of signing in a subprocess.
 
@@ -101,7 +108,22 @@ def _sign_sync(
 
     The parent async loop (process_sign_job) runs _persist_payload() after this
     returns to upload the signed file and save metadata to storage + registry.
+
+    ``trace_ctx`` is a small dict of correlation fields (``job_id``,
+    ``request_id``, ``trace_id``, ``org_id``) passed by the parent. ``contextvars``
+    do not survive ``ProcessPoolExecutor``, and on ``spawn`` start the stdlib
+    ``logging`` config is also not inherited — so we reinstall both here before
+    emitting any logs.
     """
+    # Subprocess logging bootstrap. Cheap (~1 ms) and idempotent across the
+    # pool's ``max_tasks_per_child`` window.
+    from kernel_backend.config import get_settings
+    configure_logging(get_settings())
+    if trace_ctx:
+        structlog.contextvars.bind_contextvars(**trace_ctx, phase="cpu")
+    child_log = get_logger("kernel.sign.cpu")
+    child_log.info("cpu.enter", media_path=str(media_path))
+
     certificate = Certificate(
         author_id=cert_data["author_id"],
         name=cert_data["name"],
@@ -117,11 +139,14 @@ def _sign_sync(
     parsed_org_id: UUID | None = UUID(org_id) if org_id else None
 
     if profile.has_video and profile.has_audio:
-        return _sign_av_cpu(media_path_obj, certificate, private_key_pem, pepper, media, parsed_org_id, original_filename, profile=profile)
+        payload = _sign_av_cpu(media_path_obj, certificate, private_key_pem, pepper, media, parsed_org_id, original_filename, profile=profile)
     elif profile.has_video:
-        return _sign_video_cpu(media_path_obj, certificate, private_key_pem, pepper, media, parsed_org_id, original_filename, profile=profile)
+        payload = _sign_video_cpu(media_path_obj, certificate, private_key_pem, pepper, media, parsed_org_id, original_filename, profile=profile)
     else:
-        return _sign_audio_cpu(media_path_obj, certificate, private_key_pem, pepper, media, parsed_org_id, original_filename, profile=profile)
+        payload = _sign_audio_cpu(media_path_obj, certificate, private_key_pem, pepper, media, parsed_org_id, original_filename, profile=profile)
+
+    child_log.info("cpu.exit", content_id=payload.get("content_id"), active_signals=len(payload.get("active_signals", [])))
+    return payload
 
 
 async def process_sign_job(
@@ -133,6 +158,8 @@ async def process_sign_job(
     org_pepper_hex: str | None = None,
     original_filename: str = "",
     user_email: str | None = None,
+    request_id: str | None = None,
+    trace_id: str | None = None,
 ) -> dict:
     """
     Deserialize certificate_json → Certificate, then run the CPU phase in a
@@ -148,6 +175,22 @@ async def process_sign_job(
     """
     redis = ctx.get("redis")
     arq_job_id: str = ctx.get("job_id", "unknown")
+
+    # Reset any leftover context from the prior job on this worker slot, then
+    # bind the identifiers that every subsequent log line should carry.
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(
+        job_id=arq_job_id,
+        request_id=request_id,
+        trace_id=trace_id,
+        org_id=org_id,
+    )
+    job_t0 = time.perf_counter()
+    logger.info(
+        "sign.job.start",
+        filename=original_filename,
+        has_email=bool(user_email),
+    )
 
     cert_data = json.loads(certificate_json)
     certificate = Certificate(
@@ -167,6 +210,13 @@ async def process_sign_job(
     loop = asyncio.get_event_loop()
     parsed_org_id: UUID | None = UUID(org_id) if org_id else None
 
+    trace_ctx = {
+        "job_id": arq_job_id,
+        "request_id": request_id,
+        "trace_id": trace_id,
+        "org_id": org_id,
+    }
+
     try:
         # Progress: processing (0%)
         if redis is not None:
@@ -179,7 +229,24 @@ async def process_sign_job(
         # ffmpeg transcoded non-H.264 inputs (30–120 s for large videos).
         # Running them here lets the API return as soon as bytes are on disk;
         # ValueError messages are persisted verbatim by the outer except block.
-        media_path, profile = await _validate_local_media(media_path)
+        v_t0 = time.perf_counter()
+        logger.info("sign.validation.start", media_path=media_path)
+        try:
+            media_path, profile = await _validate_local_media(media_path)
+        except ValueError as exc:
+            logger.warning(
+                "sign.validation.failed",
+                reason=str(exc),
+                elapsed_ms=round((time.perf_counter() - v_t0) * 1000, 1),
+            )
+            raise
+        logger.info(
+            "sign.validation.end",
+            duration_s=round(profile.duration_s, 2),
+            has_video=profile.has_video,
+            has_audio=profile.has_audio,
+            elapsed_ms=round((time.perf_counter() - v_t0) * 1000, 1),
+        )
 
         if process_pool is not None:
             # Progress: 20% — about to start CPU work in subprocess
@@ -188,6 +255,8 @@ async def process_sign_job(
                     "job_id": arq_job_id, "status": "processing", "progress": 20,
                 })
 
+            cpu_t0 = time.perf_counter()
+            logger.info("sign.cpu.start")
             # CPU phase — runs in subprocess, returns RawSigningPayload dict
             payload = await loop.run_in_executor(
                 process_pool,
@@ -198,10 +267,22 @@ async def process_sign_job(
                 pepper,
                 org_id,
                 original_filename,
+                trace_ctx,
+            )
+            logger.info(
+                "sign.cpu.end",
+                elapsed_ms=round((time.perf_counter() - cpu_t0) * 1000, 1),
+                active_signals=len(payload.get("active_signals", [])),
             )
 
+            persist_t0 = time.perf_counter()
+            logger.info("sign.persist.start", content_id=payload.get("content_id"))
             # I/O phase — runs in parent async loop with real storage + registry
             await _persist_payload(payload, storage, registry)
+            logger.info(
+                "sign.persist.end",
+                elapsed_ms=round((time.perf_counter() - persist_t0) * 1000, 1),
+            )
 
             result = {
                 "content_id": payload["content_id"],
@@ -283,11 +364,22 @@ async def process_sign_job(
                     result["content_id"],
                 )
             except Exception:
-                pass  # Email failure does not affect job result
+                logger.warning("sign.email_notify_failed", exc_info=True)
 
+        logger.info(
+            "sign.job.complete",
+            content_id=result["content_id"],
+            elapsed_ms=round((time.perf_counter() - job_t0) * 1000, 1),
+        )
         return result
 
     except Exception as exc:
+        logger.exception(
+            "sign.job.failed",
+            exc_type=type(exc).__name__,
+            error=str(exc)[:500],
+            elapsed_ms=round((time.perf_counter() - job_t0) * 1000, 1),
+        )
         if redis is not None:
             await _set_job_status(redis, arq_job_id, {
                 "job_id": arq_job_id,
@@ -296,6 +388,8 @@ async def process_sign_job(
                 "error": str(exc),
             })
         raise
+    finally:
+        structlog.contextvars.clear_contextvars()
 
 
 async def process_verify_job(ctx: dict, **kwargs: object) -> None:

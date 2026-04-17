@@ -1,4 +1,3 @@
-import logging
 import time
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
@@ -7,21 +6,9 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-# ---------------------------------------------------------------------------
-# Logging — configure once at import time so every module picks it up
-# ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
-# Silence noisy third-party loggers but keep ours at DEBUG
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
-logging.getLogger("arq").setLevel(logging.INFO)
+from kernel_backend.infrastructure.logging import configure_logging, get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 from kernel_backend.api.auth.router import router as auth_router
 from kernel_backend.api.health.router import router as health_router
@@ -35,6 +22,7 @@ from kernel_backend.api.invitations.router import public_router as invitations_p
 from kernel_backend.api.leads.router import admin_router as leads_admin_router
 from kernel_backend.api.leads.router import public_router as leads_public_router
 from kernel_backend.api.middleware.auth import HybridAuthMiddleware
+from kernel_backend.api.middleware.request_id import RequestIdMiddleware
 from kernel_backend.api.organizations.router import router as organizations_router
 from kernel_backend.api.public.router import router as public_verify_router
 from kernel_backend.api.signing.router import router as signing_router
@@ -49,6 +37,9 @@ from kernel_backend.infrastructure.storage import make_storage
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
+
+    # Logging — structlog bootstrap, redaction, optional Sentry.
+    configure_logging(settings)
 
     # Storage
     app.state.storage = make_storage(settings)
@@ -74,9 +65,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.redis_pool = redis_pool
     except Exception as exc:
         logger.warning(
-            "Redis unavailable — signing endpoints will return 503. "
-            "Set REDIS_HOST / REDIS_PASSWORD in .env to enable. Error: %s",
-            exc,
+            "redis.unavailable",
+            hint="signing endpoints will return 503 — set REDIS_HOST / REDIS_PASSWORD in .env",
+            error=str(exc),
         )
         app.state.redis_pool = None
 
@@ -120,44 +111,47 @@ def create_app() -> FastAPI:
     # ------------------------------------------------------------------
     from starlette.middleware.base import BaseHTTPMiddleware
 
-    _access_log = logging.getLogger("kernel.access")
+    _access_log = get_logger("kernel.access")
 
     class AccessLogMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
             start = time.perf_counter()
-            origin = request.headers.get("origin", "-")
             auth_header = request.headers.get("authorization", "")
-            token_hint = ""
             if auth_header.startswith("Bearer "):
                 raw = auth_header[7:]
-                token_hint = f"krnl_..." if raw.startswith("krnl_") else f"{raw[:12]}..."
+                token_scheme = "krnl_" if raw.startswith("krnl_") else "bearer"
+            else:
+                token_scheme = "none"
+
             _access_log.debug(
-                "→ %s %s  origin=%s  token=%s",
-                request.method,
-                request.url.path,
-                origin,
-                token_hint or "(none)",
+                "request.started",
+                method=request.method,
+                path=request.url.path,
+                origin=request.headers.get("origin"),
+                token_scheme=token_scheme,
             )
             response = await call_next(request)
             elapsed_ms = (time.perf_counter() - start) * 1000
             _access_log.info(
-                "← %s %s  status=%d  %.1fms  auth_type=%s  user=%s  org=%s  admin=%s",
-                request.method,
-                request.url.path,
-                response.status_code,
-                elapsed_ms,
-                getattr(request.state, "auth_type", "?"),
-                getattr(request.state, "user_id", "?"),
-                getattr(request.state, "org_id", "?"),
-                getattr(request.state, "is_admin", "?"),
+                "request.finished",
+                method=request.method,
+                path=request.url.path,
+                status=response.status_code,
+                elapsed_ms=round(elapsed_ms, 1),
+                auth_type=getattr(request.state, "auth_type", None),
+                user_id=getattr(request.state, "user_id", None),
+                org_id=str(getattr(request.state, "org_id", None) or "") or None,
+                is_admin=getattr(request.state, "is_admin", None),
             )
             return response
 
+    # Order: request is processed outside-in. CORS must run first so preflight
+    # OPTIONS bypasses auth; RequestId binds correlation before auth logs;
+    # AccessLog is innermost so it sees post-auth request.state.
     app.add_middleware(AccessLogMiddleware)
     app.add_middleware(HybridAuthMiddleware)
+    app.add_middleware(RequestIdMiddleware)
 
-    # CORS — must be outermost middleware so preflight OPTIONS requests are
-    # handled before HybridAuthMiddleware rejects them with 401.
     settings = get_settings()
     app.add_middleware(
         CORSMiddleware,

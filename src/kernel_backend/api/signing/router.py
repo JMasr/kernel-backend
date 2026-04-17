@@ -22,7 +22,12 @@ _MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
 
 async def _get_org_pepper_hex(org_id, session_factory) -> str | None:
-    """Return hex-encoded pepper_v1 for the org, or None if not set."""
+    """Return hex-encoded pepper_v1 for the org, or None if not set.
+
+    Pepper lookup is best-effort: if the database is momentarily unreachable
+    we log a warning and fall back to the system pepper rather than failing
+    the whole /sign request.
+    """
     if org_id is None:
         return None
     try:
@@ -33,7 +38,11 @@ async def _get_org_pepper_hex(org_id, session_factory) -> str | None:
             if org and org.pepper_v1:
                 return org.pepper_v1
     except Exception:
-        pass
+        logger.warning(
+            "pepper_lookup_failed",
+            extra={"org_id": str(org_id)},
+            exc_info=True,
+        )
     return None
 
 
@@ -52,21 +61,28 @@ async def sign(
     bytes are on disk. Validation failures surface via ``GET /sign/{job_id}``
     with ``status="failed"`` and a user-facing ``error`` string.
     """
-    logger.debug("sign: received form fields — file=%s, cert_json_len=%d, pkey_len=%d",
-                 file.filename, len(certificate_json), len(private_key_pem))
+    logger.debug(
+        "sign.form_received",
+        extra={
+            "filename": file.filename,
+            "cert_json_len": len(certificate_json) if certificate_json else 0,
+            "pkey_len": len(private_key_pem) if private_key_pem else 0,
+        },
+    )
 
-    # Ownership check — cert.author_id must match the authenticated user (JWT only)
+    # Ownership check — cert.author_id must match the authenticated user (JWT only).
+    # NB: never log ``certificate_json`` — it contains the author_id and public key.
     user_id: str | None = getattr(request.state, "user_id", None)
     user_email: str | None = getattr(request.state, "email", None)
-    logger.debug("sign: user_id=%s, certificate_json type=%s, len=%s, preview=%.200s",
-                 user_id, type(certificate_json).__name__, len(certificate_json) if certificate_json else 0,
-                 certificate_json[:200] if certificate_json else "<empty>")
     if user_id is not None:
         try:
             cert_data = json.loads(certificate_json)
             cert_author_id = cert_data.get("author_id", "")
         except (json.JSONDecodeError, AttributeError) as exc:
-            logger.warning("sign: invalid certificate_json: %s — raw value: %.500s", exc, certificate_json)
+            logger.warning(
+                "sign.cert_json_invalid",
+                extra={"reason": str(exc), "cert_json_len": len(certificate_json) if certificate_json else 0},
+            )
             raise HTTPException(status_code=422, detail="Invalid certificate JSON")
         if cert_author_id != user_id:
             raise HTTPException(
@@ -110,6 +126,10 @@ async def sign(
     redis_pool = request.app.state.redis_pool
     if redis_pool is None:
         raise HTTPException(status_code=503, detail="Job queue unavailable — configure REDIS_HOST and REDIS_PASSWORD in .env")
+
+    request_id = getattr(request.state, "request_id", None)
+    trace_id = getattr(request.state, "trace_id", None)
+
     job = await redis_pool.enqueue_job(
         "process_sign_job",
         media_path=media_path,
@@ -119,6 +139,8 @@ async def sign(
         org_pepper_hex=org_pepper_hex,
         original_filename=file.filename or "",
         user_email=user_email,
+        request_id=request_id,
+        trace_id=trace_id,
     )
 
     # Initialize job status in Redis for progress tracking
@@ -126,6 +148,16 @@ async def sign(
         f"job:{job.job_id}:status",
         json.dumps({"job_id": job.job_id, "status": "pending", "progress": 0}),
         ex=3600,
+    )
+
+    logger.info(
+        "sign.enqueued",
+        extra={
+            "job_id": job.job_id,
+            "filename": file.filename,
+            "bytes": total,
+            "org_id": str(org_id) if org_id is not None else None,
+        },
     )
 
     return SignJobResponse(job_id=job.job_id, status="queued")
