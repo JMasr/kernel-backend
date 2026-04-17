@@ -64,7 +64,7 @@ async def sign(
     logger.debug(
         "sign.form_received",
         extra={
-            "filename": file.filename,
+            "upload_filename": file.filename,
             "cert_json_len": len(certificate_json) if certificate_json else 0,
             "pkey_len": len(private_key_pem) if private_key_pem else 0,
         },
@@ -154,7 +154,7 @@ async def sign(
         "sign.enqueued",
         extra={
             "job_id": job.job_id,
-            "filename": file.filename,
+            "upload_filename": file.filename,
             "bytes": total,
             "org_id": str(org_id) if org_id is not None else None,
         },
