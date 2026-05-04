@@ -139,6 +139,8 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
         request.state.auth_type = "api_key"
         request.state.user_id = None
         request.state.is_admin = False
+        request.state.api_key_id = api_key.id
+        request.state.scopes = api_key.scopes
         _bind_auth(
             auth_type="api_key",
             user_id=None,
@@ -176,6 +178,8 @@ class HybridAuthMiddleware(BaseHTTPMiddleware):
             request.state.auth_type = "public"
             request.state.user_id = None
             request.state.is_admin = False
+            request.state.api_key_id = None
+            request.state.scopes = []
             _bind_auth(auth_type="public", user_id=None, org_id=None, is_admin=False)
             return await call_next(request)
 
@@ -287,6 +291,8 @@ class HybridAuthMiddleware(BaseHTTPMiddleware):
         request.state.user_id = email
         request.state.email = email
         request.state.is_admin = is_admin
+        request.state.api_key_id = None
+        request.state.scopes = []
         _bind_auth(
             auth_type="local_jwt",
             user_id=email,
@@ -313,6 +319,8 @@ class HybridAuthMiddleware(BaseHTTPMiddleware):
         request.state.user_id = None
         request.state.email = None
         request.state.is_admin = False
+        request.state.api_key_id = api_key.id
+        request.state.scopes = api_key.scopes
         _bind_auth(
             auth_type="api_key",
             user_id=None,
@@ -451,6 +459,8 @@ class HybridAuthMiddleware(BaseHTTPMiddleware):
         request.state.auth_type = "neon_auth"
         request.state.user_id = user_id
         request.state.is_admin = is_admin
+        request.state.api_key_id = None
+        request.state.scopes = []
         _bind_auth(
             auth_type="neon_auth",
             user_id=user_id,

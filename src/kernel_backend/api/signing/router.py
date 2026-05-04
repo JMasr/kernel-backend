@@ -10,6 +10,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 logger = logging.getLogger("kernel.signing")
 from arq.jobs import Job, JobStatus
 
+from kernel_backend.api.rate_limit import limiter
 from kernel_backend.api.signing.schemas import (
     SignJobResponse,
     SignJobResult,
@@ -47,6 +48,7 @@ async def _get_org_pepper_hex(org_id, session_factory) -> str | None:
 
 
 @router.post("/sign", status_code=202, response_model=SignJobResponse)
+@limiter.limit("10/minute")
 async def sign(
     request: Request,
     file: UploadFile = File(..., description="Audio or AV media file"),
@@ -70,24 +72,60 @@ async def sign(
         },
     )
 
-    # Ownership check — cert.author_id must match the authenticated user (JWT only).
-    # NB: never log ``certificate_json`` — it contains the author_id and public key.
     user_id: str | None = getattr(request.state, "user_id", None)
     user_email: str | None = getattr(request.state, "email", None)
+    auth_type: str = getattr(request.state, "auth_type", "")
+
+    # Scope check for API key auth
+    if auth_type == "api_key":
+        if "sign" not in getattr(request.state, "scopes", []):
+            raise HTTPException(status_code=403, detail="API key does not have 'sign' scope")
+
+    # Parse certificate JSON — required for both JWT and API key auth
+    # NB: never log ``certificate_json`` — it contains the author_id and public key.
+    try:
+        cert_data = json.loads(certificate_json)
+        cert_author_id = cert_data.get("author_id", "")
+    except (json.JSONDecodeError, AttributeError) as exc:
+        logger.warning(
+            "sign.cert_json_invalid",
+            extra={"reason": str(exc), "cert_json_len": len(certificate_json) if certificate_json else 0},
+        )
+        raise HTTPException(status_code=422, detail="Invalid certificate JSON")
+
     if user_id is not None:
-        try:
-            cert_data = json.loads(certificate_json)
-            cert_author_id = cert_data.get("author_id", "")
-        except (json.JSONDecodeError, AttributeError) as exc:
-            logger.warning(
-                "sign.cert_json_invalid",
-                extra={"reason": str(exc), "cert_json_len": len(certificate_json) if certificate_json else 0},
-            )
-            raise HTTPException(status_code=422, detail="Invalid certificate JSON")
+        # JWT path: certificate must belong to the authenticated user
         if cert_author_id != user_id:
             raise HTTPException(
                 status_code=403,
                 detail="Certificate does not belong to the authenticated user",
+            )
+    elif auth_type == "api_key":
+        # API key path: author_id must be an identity registered under the same org
+        if not cert_author_id:
+            raise HTTPException(status_code=422, detail="Certificate missing author_id")
+        org_id_for_check = getattr(request.state, "org_id", None)
+        try:
+            from kernel_backend.infrastructure.database.models import Identity
+            from sqlalchemy import select as _sa_select
+            session_factory = request.app.state.db_session_factory
+            async with session_factory() as _session:
+                _result = await _session.execute(
+                    _sa_select(Identity.org_id).where(Identity.author_id == cert_author_id)
+                )
+                identity_org_id = _result.scalar_one_or_none()
+        except Exception:
+            logger.exception("sign.identity_org_lookup_failed", extra={"author_id": cert_author_id})
+            raise HTTPException(status_code=500, detail="Could not verify certificate ownership")
+        if identity_org_id is None:
+            raise HTTPException(
+                status_code=403,
+                detail="Certificate author_id not found",
+            )
+        if identity_org_id != org_id_for_check:
+            raise HTTPException(
+                status_code=403,
+                detail="Certificate author_id does not belong to the authenticated organization",
             )
 
     suffix = Path(file.filename or "upload.aac").suffix or ".aac"

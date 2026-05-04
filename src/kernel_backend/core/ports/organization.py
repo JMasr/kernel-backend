@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
@@ -27,6 +28,8 @@ class OrganizationPort(ABC):
         key_hash: str,
         key_prefix: str,
         name: Optional[str],
+        scopes: list[str] | None = None,
+        expires_at: Optional[datetime] = None,
     ) -> APIKey:
         """Persist a new API key and return it."""
 
@@ -77,3 +80,31 @@ class OrganizationPort(ABC):
         self, org_id: UUID, user_id: str, role: str
     ) -> OrganizationMember:
         """Change a member's role and return the updated record."""
+
+    @abstractmethod
+    async def get_api_key_by_id(self, key_id: UUID, org_id: UUID) -> Optional[APIKey]:
+        """Return an API key by ID scoped to org, or None."""
+
+    @abstractmethod
+    async def list_api_keys(
+        self, org_id: UUID, limit: int = 20, offset: int = 0
+    ) -> list[APIKey]:
+        """Return paginated API keys for an org."""
+
+    @abstractmethod
+    async def count_api_keys(self, org_id: UUID) -> int:
+        """Return total API key count for an org."""
+
+    @abstractmethod
+    async def deactivate_api_key(self, key_id: UUID, org_id: UUID) -> bool:
+        """Soft-delete a key by setting is_active=False. Returns True if found."""
+
+    @abstractmethod
+    async def update_api_key(
+        self,
+        key_id: UUID,
+        org_id: UUID,
+        name: Optional[str] = None,
+        is_active: Optional[bool] = None,
+    ) -> Optional[APIKey]:
+        """Update mutable fields of an API key."""

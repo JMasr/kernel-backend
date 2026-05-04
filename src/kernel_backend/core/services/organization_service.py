@@ -1,5 +1,6 @@
 import hashlib
 import secrets
+from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
@@ -22,13 +23,21 @@ class OrganizationService:
         return org, member
 
     async def create_api_key(
-        self, org_id: UUID, name: Optional[str] = None
+        self,
+        org_id: UUID,
+        name: Optional[str] = None,
+        scopes: list[str] | None = None,
+        expires_at: Optional[datetime] = None,
     ) -> tuple[APIKey, str]:
         """Generate a new API key for the org. Returns (APIKey, plaintext_key)."""
         plaintext = f"krnl_{secrets.token_hex(16)}"
         key_hash = hashlib.sha256(plaintext.encode()).hexdigest()
         key_prefix = plaintext[:12]
-        api_key = await self._repo.create_api_key(org_id, key_hash, key_prefix, name)
+        api_key = await self._repo.create_api_key(
+            org_id, key_hash, key_prefix, name,
+            scopes=scopes,
+            expires_at=expires_at,
+        )
         return api_key, plaintext
 
     async def verify_api_key(self, plaintext_key: str) -> Optional[APIKey]:
@@ -97,3 +106,25 @@ class OrganizationService:
         if not await self._repo.get_member(org_id, user_id):
             raise ValueError("Member not found")
         return await self._repo.update_member_role(org_id, user_id, role)
+
+    async def list_api_keys(
+        self, org_id: UUID, limit: int = 20, offset: int = 0
+    ) -> tuple[list[APIKey], int]:
+        """Return (api_keys, total_count) for an organization."""
+        keys = await self._repo.list_api_keys(org_id, limit=limit, offset=offset)
+        total = await self._repo.count_api_keys(org_id)
+        return keys, total
+
+    async def revoke_api_key(self, org_id: UUID, key_id: UUID) -> bool:
+        """Soft-revoke an API key. Returns True if found and deactivated."""
+        return await self._repo.deactivate_api_key(key_id, org_id)
+
+    async def update_api_key(
+        self,
+        org_id: UUID,
+        key_id: UUID,
+        name: Optional[str] = None,
+        is_active: Optional[bool] = None,
+    ) -> Optional[APIKey]:
+        """Update mutable fields of an API key."""
+        return await self._repo.update_api_key(key_id, org_id, name=name, is_active=is_active)

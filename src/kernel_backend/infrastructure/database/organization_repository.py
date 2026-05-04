@@ -33,6 +33,8 @@ def _apikey_row_to_domain(row: ApiKeyRecord) -> APIKey:
         created_at=row.created_at,
         last_used_at=row.last_used_at,
         is_active=row.is_active,
+        scopes=row.scopes if row.scopes is not None else ["sign", "verify"],
+        expires_at=row.expires_at,
     )
 
 
@@ -80,6 +82,8 @@ class OrganizationRepository(OrganizationPort):
         key_hash: str,
         key_prefix: str,
         name: Optional[str],
+        scopes: list[str] | None = None,
+        expires_at: datetime | None = None,
     ) -> APIKey:
         record = ApiKeyRecord(
             id=uuid.uuid4(),
@@ -88,6 +92,8 @@ class OrganizationRepository(OrganizationPort):
             key_prefix=key_prefix,
             name=name,
             is_active=True,
+            scopes=scopes if scopes is not None else ["sign", "verify"],
+            expires_at=expires_at,
         )
         self._session.add(record)
         await self._session.flush()
@@ -105,6 +111,12 @@ class OrganizationRepository(OrganizationPort):
         row = result.scalar_one_or_none()
         if row is None:
             return None
+        if row.expires_at is not None:
+            exp = row.expires_at
+            if exp.tzinfo is None:  # SQLite in tests returns naive datetimes
+                exp = exp.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) >= exp:
+                return None
         # Update last_used_at
         await self._session.execute(
             update(ApiKeyRecord)
@@ -213,3 +225,65 @@ class OrganizationRepository(OrganizationPort):
             )
         )
         return _member_row_to_domain(result.scalar_one())
+
+    # ------------------------------------------------------------------
+    # API key CRUD
+    # ------------------------------------------------------------------
+
+    async def get_api_key_by_id(self, key_id: UUID, org_id: UUID) -> Optional[APIKey]:
+        result = await self._session.execute(
+            select(ApiKeyRecord).where(
+                ApiKeyRecord.id == key_id,
+                ApiKeyRecord.org_id == org_id,
+            )
+        )
+        row = result.scalar_one_or_none()
+        return None if row is None else _apikey_row_to_domain(row)
+
+    async def list_api_keys(
+        self, org_id: UUID, limit: int = 20, offset: int = 0
+    ) -> list[APIKey]:
+        result = await self._session.execute(
+            select(ApiKeyRecord)
+            .where(ApiKeyRecord.org_id == org_id)
+            .order_by(ApiKeyRecord.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return [_apikey_row_to_domain(r) for r in result.scalars().all()]
+
+    async def count_api_keys(self, org_id: UUID) -> int:
+        result = await self._session.execute(
+            select(func.count()).select_from(ApiKeyRecord).where(ApiKeyRecord.org_id == org_id)
+        )
+        return result.scalar_one()
+
+    async def deactivate_api_key(self, key_id: UUID, org_id: UUID) -> bool:
+        result = await self._session.execute(
+            update(ApiKeyRecord)
+            .where(ApiKeyRecord.id == key_id, ApiKeyRecord.org_id == org_id)
+            .values(is_active=False)
+        )
+        await self._session.commit()
+        return result.rowcount > 0
+
+    async def update_api_key(
+        self,
+        key_id: UUID,
+        org_id: UUID,
+        name: Optional[str] = None,
+        is_active: Optional[bool] = None,
+    ) -> Optional[APIKey]:
+        values: dict = {}
+        if name is not None:
+            values["name"] = name
+        if is_active is not None:
+            values["is_active"] = is_active
+        if values:
+            await self._session.execute(
+                update(ApiKeyRecord)
+                .where(ApiKeyRecord.id == key_id, ApiKeyRecord.org_id == org_id)
+                .values(**values)
+            )
+            await self._session.commit()
+        return await self.get_api_key_by_id(key_id, org_id)

@@ -5,6 +5,8 @@ from collections.abc import AsyncIterator
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
 from kernel_backend.infrastructure.logging import configure_logging, get_logger
 
@@ -23,6 +25,7 @@ from kernel_backend.api.leads.router import admin_router as leads_admin_router
 from kernel_backend.api.leads.router import public_router as leads_public_router
 from kernel_backend.api.middleware.auth import HybridAuthMiddleware
 from kernel_backend.api.middleware.request_id import RequestIdMiddleware
+from kernel_backend.api.rate_limit import limiter
 from kernel_backend.api.organizations.router import router as organizations_router
 from kernel_backend.api.public.router import router as public_verify_router
 from kernel_backend.api.signing.router import router as signing_router
@@ -73,6 +76,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Registry for verification endpoints (session-per-call wrapper)
     app.state.registry = SessionFactoryRegistry(app.state.db_session_factory)
+
+    # Rate limiter — configure Redis backend when Redis is available
+    if redis_pool is not None:
+        redis_url = (
+            f"redis://:{settings.REDIS_PASSWORD}@{settings.REDIS_HOST}:{settings.REDIS_PORT}"
+            if settings.REDIS_PASSWORD
+            else f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}"
+        )
+        limiter._storage_uri = redis_url
+    app.state.limiter = limiter
 
     yield
 
@@ -151,6 +164,7 @@ def create_app() -> FastAPI:
     app.add_middleware(AccessLogMiddleware)
     app.add_middleware(HybridAuthMiddleware)
     app.add_middleware(RequestIdMiddleware)
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
     settings = get_settings()
     app.add_middleware(

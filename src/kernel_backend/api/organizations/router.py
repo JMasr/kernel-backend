@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from kernel_backend.api.dependencies import get_session
 from kernel_backend.api.organizations.schemas import (
     AddMemberRequest,
+    ApiKeyListResponse,
     ApiKeyResponse,
     CreateApiKeyRequest,
     CreateOrganizationRequest,
@@ -13,6 +14,7 @@ from kernel_backend.api.organizations.schemas import (
     OrganizationResponse,
     PaginatedMembersResponse,
     PaginatedOrganizationsResponse,
+    UpdateApiKeyRequest,
     UpdateMemberRoleRequest,
     UpdateOrganizationRequest,
     UserOrganizationResponse,
@@ -66,13 +68,22 @@ async def create_api_key(
     service = _get_service(session)
     if not await service.is_admin(org_id, user_id):
         raise HTTPException(status_code=403, detail="Admin role required")
-    api_key, plaintext = await service.create_api_key(org_id, name=body.name)
+    api_key, plaintext = await service.create_api_key(
+        org_id,
+        name=body.name,
+        scopes=body.scopes,
+        expires_at=body.expires_at,
+    )
     return ApiKeyResponse(
         key_id=api_key.id,
         key_prefix=api_key.key_prefix,
         name=api_key.name,
         plaintext_key=plaintext,
         created_at=api_key.created_at,
+        last_used_at=api_key.last_used_at,
+        is_active=api_key.is_active,
+        scopes=api_key.scopes,
+        expires_at=api_key.expires_at,
     )
 
 
@@ -161,6 +172,98 @@ async def delete_organization(
         await service.delete_organization(org_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# API key management (admin only)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{org_id}/api-keys", response_model=ApiKeyListResponse)
+async def list_api_keys(
+    org_id: UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+) -> ApiKeyListResponse:
+    """List API keys for an organization. plaintext_key is never returned here."""
+    user_id: str | None = getattr(request.state, "user_id", None)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    service = _get_service(session)
+    if not await service.is_admin(org_id, user_id):
+        raise HTTPException(status_code=403, detail="Admin role required")
+    keys, total = await service.list_api_keys(org_id, limit=limit, offset=(page - 1) * limit)
+    return ApiKeyListResponse(
+        items=[
+            ApiKeyResponse(
+                key_id=k.id,
+                key_prefix=k.key_prefix,
+                name=k.name,
+                plaintext_key=None,
+                created_at=k.created_at,
+                last_used_at=k.last_used_at,
+                is_active=k.is_active,
+                scopes=k.scopes,
+                expires_at=k.expires_at,
+            )
+            for k in keys
+        ],
+        total=total,
+        page=page,
+        total_pages=max(1, (total + limit - 1) // limit),
+    )
+
+
+@router.delete("/{org_id}/api-keys/{key_id}", status_code=204)
+async def revoke_api_key(
+    org_id: UUID,
+    key_id: UUID,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> None:
+    """Revoke (soft-deactivate) an API key."""
+    user_id: str | None = getattr(request.state, "user_id", None)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    service = _get_service(session)
+    if not await service.is_admin(org_id, user_id):
+        raise HTTPException(status_code=403, detail="Admin role required")
+    found = await service.revoke_api_key(org_id, key_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="API key not found")
+
+
+@router.patch("/{org_id}/api-keys/{key_id}", response_model=ApiKeyResponse)
+async def update_api_key(
+    org_id: UUID,
+    key_id: UUID,
+    body: UpdateApiKeyRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> ApiKeyResponse:
+    """Update API key name or active status."""
+    user_id: str | None = getattr(request.state, "user_id", None)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    service = _get_service(session)
+    if not await service.is_admin(org_id, user_id):
+        raise HTTPException(status_code=403, detail="Admin role required")
+    key = await service.update_api_key(org_id, key_id, name=body.name, is_active=body.is_active)
+    if key is None:
+        raise HTTPException(status_code=404, detail="API key not found")
+    return ApiKeyResponse(
+        key_id=key.id,
+        key_prefix=key.key_prefix,
+        name=key.name,
+        plaintext_key=None,
+        created_at=key.created_at,
+        last_used_at=key.last_used_at,
+        is_active=key.is_active,
+        scopes=key.scopes,
+        expires_at=key.expires_at,
+    )
 
 
 # ---------------------------------------------------------------------------

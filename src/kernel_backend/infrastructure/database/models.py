@@ -36,6 +36,8 @@ class ApiKeyRecord(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     last_used_at = Column(DateTime(timezone=True), nullable=True)
     is_active = Column(Boolean, nullable=False, server_default="true")
+    scopes = Column(JSON, nullable=False, server_default='["sign", "verify"]')
+    expires_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class OrgMemberRecord(Base):

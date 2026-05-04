@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 from uuid import UUID
@@ -27,6 +27,8 @@ class APIKey:
     created_at: datetime
     last_used_at: Optional[datetime]
     is_active: bool
+    scopes: list[str] = field(default_factory=lambda: ["sign", "verify"])
+    expires_at: Optional[datetime] = field(default=None)
 
 
 @dataclass

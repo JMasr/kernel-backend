@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 
+from kernel_backend.api.rate_limit import limiter
 from kernel_backend.api.verification.schemas import VerificationResponse
 from kernel_backend.config import Settings
 from kernel_backend.core.domain.verification import AVVerificationResult, VerificationResult
@@ -125,6 +126,7 @@ def _to_response(result: VerificationResult | AVVerificationResult) -> Verificat
         "Returns 500 only for unexpected infrastructure failures."
     ),
 )
+@limiter.limit("60/minute")
 async def verify_media(
     request: Request,
     file: UploadFile = File(..., description="Audio or video media file to verify"),
@@ -133,6 +135,11 @@ async def verify_media(
     content = await file.read()
     if len(content) > _MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large (max 2 GB)")
+
+    # Scope check for API key auth
+    if getattr(request.state, "auth_type", "") == "api_key":
+        if "verify" not in getattr(request.state, "scopes", []):
+            raise HTTPException(status_code=403, detail="API key does not have 'verify' scope")
 
     # Extension allowlist — reject unsupported formats early
     from kernel_backend.core.services.format_validation import validate_media_extension

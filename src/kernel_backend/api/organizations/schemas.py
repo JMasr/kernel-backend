@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class CreateOrganizationRequest(BaseModel):
@@ -17,14 +17,43 @@ class OrganizationResponse(BaseModel):
 
 class CreateApiKeyRequest(BaseModel):
     name: Optional[str] = Field(None, max_length=255)
+    scopes: list[str] = Field(default=["sign", "verify"])
+    expires_at: Optional[datetime] = Field(None, description="ISO 8601 datetime. None = never expires.")
+
+    @field_validator("scopes")
+    @classmethod
+    def validate_scopes(cls, v: list[str]) -> list[str]:
+        allowed = {"sign", "verify"}
+        invalid = set(v) - allowed
+        if invalid:
+            raise ValueError(f"Invalid scopes: {invalid}. Allowed: {allowed}")
+        if not v:
+            raise ValueError("scopes must contain at least one value")
+        return v
 
 
 class ApiKeyResponse(BaseModel):
     key_id: UUID
     key_prefix: str
     name: Optional[str]
-    plaintext_key: str
+    plaintext_key: Optional[str] = None
     created_at: datetime
+    last_used_at: Optional[datetime] = None
+    is_active: bool = True
+    scopes: list[str] = Field(default=["sign", "verify"])
+    expires_at: Optional[datetime] = None
+
+
+class ApiKeyListResponse(BaseModel):
+    items: list[ApiKeyResponse]
+    total: int
+    page: int
+    total_pages: int
+
+
+class UpdateApiKeyRequest(BaseModel):
+    name: Optional[str] = Field(None, max_length=255)
+    is_active: Optional[bool] = None
 
 
 class UserOrganizationResponse(BaseModel):
