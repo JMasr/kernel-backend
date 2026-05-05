@@ -58,8 +58,12 @@ from kernel_backend.engine.video.fingerprint import (
 )
 from kernel_backend.engine.video.wid_watermark import WID_AGREEMENT_THRESHOLD, extract_segment
 
+import logging as _logging
+
 _AUDIO_FINGERPRINT_SEGMENT_S = 2.0  # matches signing_service.py
 _MAX_HAMMING_CANDIDATE = 10         # max Hamming distance to consider a fingerprint match
+
+_logger = _logging.getLogger("kernel.verification")
 
 
 def _hamming(a: str, b: str) -> int:
@@ -417,15 +421,22 @@ class VerificationService:
         stored_manifest = _manifest_from_json(entry.manifest_json) if entry.manifest_json else None
 
         # Phase B — extract audio WID via DSSS
-        _ap = entry.embedding_params.audio
-        decoded_wid, decodable, n_seg, n_dec, n_era = self._extract_audio_wid(
-            media_path, media, content_id, author_public_key, entry.rs_n, pepper,
-            chips_per_bit=_ap.chips_per_bit,
-            force_levels=list(_ap.dwt_levels),
-            target_subband=_ap.target_subband,
-            segment_map=_ap.segment_map,
-            audio_chunks=audio_chunks,
-        )
+        # Guard: audio may be None for video-only entries that somehow reach
+        # this path (e.g. legacy entries before EmbeddingParams was populated).
+        _ap = entry.embedding_params.audio if entry.embedding_params else None
+        if _ap is not None:
+            decoded_wid, decodable, n_seg, n_dec, n_era = self._extract_audio_wid(
+                media_path, media, content_id, author_public_key, entry.rs_n, pepper,
+                chips_per_bit=_ap.chips_per_bit,
+                force_levels=list(_ap.dwt_levels),
+                target_subband=_ap.target_subband,
+                segment_map=_ap.segment_map,
+                audio_chunks=audio_chunks,
+            )
+        else:
+            decoded_wid = None
+            decodable = False
+            n_seg = n_dec = n_era = 0
 
         if not decodable:
             return VerificationResult(
@@ -555,6 +566,18 @@ class VerificationService:
         # audio WID was embedded — skip extraction and treat audio as
         # pass-through in the verdict composition.
         _ap_av = entry.embedding_params.audio if entry.embedding_params else None
+        _logger.debug(
+            "verify_av.audio_params",
+            extra={
+                "content_id": content_id,
+                "rs_n": entry.rs_n,
+                "has_audio_params": _ap_av is not None,
+                "dwt_levels": list(_ap_av.dwt_levels) if _ap_av else None,
+                "chips_per_bit": _ap_av.chips_per_bit if _ap_av else None,
+                "target_subband": _ap_av.target_subband if _ap_av else None,
+                "segment_map_len": len(_ap_av.segment_map.selected_indices) if (_ap_av and _ap_av.segment_map) else None,
+            },
+        )
         if _ap_av is not None:
             (audio_wid, audio_decodable,
              audio_n_seg, audio_n_dec, audio_n_era) = self._extract_audio_wid(
@@ -803,6 +826,7 @@ class VerificationService:
 
         symbols: list[int | None] = [None] * rs_n
         erasure_positions: list[int] = []
+        z_scores_all: list[float] = []
         n_segments_total = 0
         n_extracted = 0
 
@@ -838,6 +862,7 @@ class VerificationService:
             symbol_byte, mean_z = extract_audio_symbol(
                 chunk, band_configs[rs_idx], pn_seed, chips_per_bit=chips_per_bit
             )
+            z_scores_all.append(round(mean_z, 3))
 
             if mean_z < ERASURE_THRESHOLD_Z:
                 symbols[rs_idx] = None
@@ -851,11 +876,41 @@ class VerificationService:
         n_erasures = len(erasure_positions)
         n_decoded = rs_n - n_erasures
 
+        _logger.debug(
+            "audio.wid.extraction",
+            extra={
+                "content_id": content_id,
+                "rs_n": rs_n,
+                "n_segments_total": n_segments_total,
+                "n_extracted": n_extracted,
+                "n_erasures": n_erasures,
+                "erasure_positions": erasure_positions[:20],
+                "force_levels": force_levels,
+                "chips_per_bit": chips_per_bit,
+                "segment_map_len": len(segment_map.selected_indices) if segment_map else None,
+                "z_scores_sample": z_scores_all[:10],
+                "z_score_mean": round(sum(z_scores_all) / len(z_scores_all), 3) if z_scores_all else 0.0,
+                "z_score_max": round(max(z_scores_all), 3) if z_scores_all else 0.0,
+            },
+        )
+
         codec = ReedSolomonCodec(rs_n)
         try:
             decoded = codec.decode(symbols)
             return decoded, True, n_segments_total, n_decoded, n_erasures
         except ReedSolomonError:
+            _logger.warning(
+                "audio.wid.rs_decode_failed",
+                extra={
+                    "content_id": content_id,
+                    "rs_n": rs_n,
+                    "n_erasures": n_erasures,
+                    "max_correctable": rs_n - 16,
+                    "n_segments_total": n_segments_total,
+                    "force_levels": force_levels,
+                    "chips_per_bit": chips_per_bit,
+                },
+            )
             return None, False, n_segments_total, n_decoded, n_erasures
 
     def _extract_video_wid(
