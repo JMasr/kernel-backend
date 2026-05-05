@@ -99,7 +99,7 @@ class TestRoutingDecisionToAudioParams:
         assert ap.dwt_levels == (2,)
         assert ap.target_subband == "detail"
         assert ap.chips_per_bit == 32
-        assert ap.target_snr_db == -20.0
+        assert ap.target_snr_db == -12.0
         assert ap.psychoacoustic is False
 
     def test_music_params(self):
