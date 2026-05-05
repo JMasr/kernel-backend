@@ -5,7 +5,29 @@ on:
     branches: [master]
 
 jobs:
+  # ── Unit tests run before building the image ────────────────────────────────
+  # Scope: tests/unit only — no ffmpeg, no database, no external services.
+  # Integration tests (marked slow/integration) run only in the dev stack.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install dependencies (with dev extras)
+        run: uv sync --extra dev
+
+      - name: Run unit tests
+        run: uv run pytest tests/unit -x -v --tb=short
+
+  # ── Build and push only if tests pass ───────────────────────────────────────
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

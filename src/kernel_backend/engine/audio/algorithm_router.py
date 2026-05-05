@@ -30,7 +30,7 @@ _ROUTING_TABLE: dict[str, dict] = {
         "dwt_levels": (2,),
         "target_subband": "detail",
         "chips_per_bit": 32,
-        "target_snr_db": -20.0,
+        "target_snr_db": -12.0,  # was -20.0; cD2 band_rms≈0.002 ≪ AAC noise≈0.007, -12 dB brings amplitude above noise floor
         "frame_length_ms": 0.0,
         "pn_sequence_length": 0,
         "psychoacoustic": False,

@@ -313,3 +313,36 @@ def test_segment_map_none_backward_compat() -> None:
     ep = embedding_params_from_dict(d)
     assert ep.audio is not None
     assert ep.audio.segment_map is None
+
+
+def test_amplitude_floor_for_low_energy_detail_band() -> None:
+    """Regression: speech cD2 band_rms≈0.002 at -20 dB → amplitude=0.0002 < AAC noise.
+
+    The 5e-4 amplitude floor must keep Z > ERASURE_THRESHOLD_Z even when
+    target_snr_db formula alone would produce a sub-threshold amplitude.
+    """
+    rng = np.random.default_rng(42)
+    # Low-amplitude white noise: band_rms in cD2 ≈ 0.003 (similar to real speech)
+    seg = rng.standard_normal(SEG_LEN).astype(np.float32) * 0.003
+
+    bc = _default_bc(0)  # detail band, DWT level 2
+    seed = _pn_seed(0)
+    chips_per_bit = 32
+
+    # Confirm the band is in the low-energy regime (floor should activate at -20 dB)
+    coeffs = pywt.wavedec(seg.astype(np.float64), "db4", level=2, mode="periodization")
+    band_rms_cd2 = float(np.sqrt(np.mean(coeffs[-2] ** 2)))
+    # Without floor: amplitude = band_rms_cd2 * 10^(-20/20) ≈ 0.003 * 0.1 = 0.0003 < 5e-4
+    assert band_rms_cd2 * (10.0 ** (-20.0 / 20.0)) < 5e-4, (
+        f"Test setup: expected unaided amplitude < floor (got band_rms={band_rms_cd2:.6f})"
+    )
+
+    embedded = embed_segment(seg, rs_symbol=0b10101010, band_config=bc,
+                              pn_seed=seed, chips_per_bit=chips_per_bit,
+                              target_snr_db=-20.0)
+
+    z = extract_segment(embedded, bc, seed, chips_per_bit=chips_per_bit)
+    assert z > ERASURE_THRESHOLD_Z, (
+        f"Z={z:.4f} ≤ ERASURE_THRESHOLD_Z={ERASURE_THRESHOLD_Z} — "
+        f"amplitude floor not effective (band_rms_cd2={band_rms_cd2:.6f})"
+    )

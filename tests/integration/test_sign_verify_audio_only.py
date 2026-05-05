@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from kernel_backend.core.domain.identity import Certificate
@@ -142,6 +143,126 @@ async def test_audio_unsigned_returns_red_candidate_not_found(
 
     assert result.verdict == Verdict.RED
     assert result.red_reason == RedReason.CANDIDATE_NOT_FOUND
+
+
+@pytest.fixture(scope="module")
+def synthetic_speech_like_120s(tmp_path_factory) -> Path:
+    """120s LP-filtered noise with silence gaps — classified as 'speech' by content profiler.
+
+    Signal design targets the content profiler's speech branch:
+    - 4th-order Butterworth LP at 3500 Hz → flatness ≈ 0 (bypasses ambient check),
+      low centroid (~1750 Hz), low rolloff (~2975 Hz)
+    - 1.5s active / 1.0s silent burst pattern → low_energy_ratio > 0.35,
+      high ZCR std (silent frames ZCR=0, active frames ZCR≈0.3)
+
+    This is the audio profile that caused the production verification failure:
+    cD2 band (5.5-11 kHz) has near-zero energy for LP-filtered speech-like content,
+    which triggers the amplitude floor fix in embed_segment.
+    """
+    from scipy.signal import butter, lfilter
+    import scipy.io.wavfile as wavfile
+
+    SR = 44100
+    duration_s = 120
+    n = SR * duration_s
+    rng = np.random.default_rng(42)
+
+    # 1.5s on / 1.0s off burst pattern → speech-like low_energy_ratio and ZCR std
+    active_len = int(1.5 * SR)
+    silent_len = int(1.0 * SR)
+    raw = np.zeros(n, dtype=np.float64)
+    pos = 0
+    while pos < n:
+        end = min(pos + active_len, n)
+        raw[pos:end] = rng.standard_normal(end - pos)
+        pos = end + silent_len
+
+    # 4th-order Butterworth LP at 3500 Hz: suppresses cD2 band, keeps centroid low
+    b, a = butter(4, 3500.0 / (SR / 2.0), btype="low")
+    audio = (lfilter(b, a, raw) * 0.25).astype(np.float32)
+
+    tmp = tmp_path_factory.mktemp("integ_speech")
+    out = tmp / "speech_like_120s.wav"
+    wavfile.write(str(out), SR, (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16))
+    return out
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+async def test_audio_sign_verify_speech_routing(
+    synthetic_speech_like_120s: Path,
+) -> None:
+    """
+    [BLOCKING — regression] sign_audio → verify_audio using content-adaptive routing.
+
+    This is the critical path that caused production failures: speech audio routed
+    to the cD2 detail band has very low band energy, making the watermark amplitude
+    negligible without the 5e-4 amplitude floor in embed_segment.
+
+    Verifies:
+    - Content profiler classifies LP-filtered noise as 'speech'
+    - Router selects detail subband (not approximation)
+    - Full sign+verify roundtrip returns VERIFIED with wid_match=True
+    """
+    from kernel_backend.engine.audio.algorithm_router import route
+    from kernel_backend.engine.audio.content_profiler import profile_audio
+    import librosa
+
+    private_pem, public_pem = generate_keypair()
+    cert = _make_cert(public_pem)
+    storage = FakeStorage()
+    registry = FakeRegistry()
+    media = MediaService()
+
+    # Confirm the fixture is actually classified as speech before signing
+    samples, _ = librosa.load(str(synthetic_speech_like_120s), sr=22050, mono=True)
+    content_profile = profile_audio(samples, 22050)
+    assert content_profile.content_type == "speech", (
+        f"Fixture must classify as 'speech', got '{content_profile.content_type}' "
+        f"(confidence={content_profile.confidence:.2f}). "
+        "Check synthetic_speech_like_120s fixture design."
+    )
+    routing = route(content_profile)
+    assert routing.parameters["target_subband"] == "detail", (
+        f"Speech must route to 'detail' subband, got '{routing.parameters['target_subband']}'"
+    )
+
+    # Sign WITHOUT explicit audio_params — content profiler + router must run
+    sign_result = await sign_audio(
+        media_path=synthetic_speech_like_120s,
+        certificate=cert,
+        private_key_pem=private_pem,
+        storage=storage,
+        registry=registry,
+        pepper=PEPPER,
+        media=media,
+    )
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        signed_path = Path(tmp.name)
+    try:
+        signed_bytes = await storage.get(sign_result.signed_media_key)
+        signed_path.write_bytes(signed_bytes)
+
+        service = VerificationService()
+        result: VerificationResult = await service.verify_audio(
+            media_path=signed_path,
+            media=media,
+            storage=storage,
+            registry=registry,
+            pepper=PEPPER,
+        )
+    finally:
+        signed_path.unlink(missing_ok=True)
+
+    assert result.verdict == Verdict.VERIFIED, (
+        f"Expected VERIFIED but got {result.verdict} (reason={result.red_reason}). "
+        f"Decoded {result.n_segments_decoded}/{result.n_segments_total} segments "
+        f"({result.n_erasures} erasures). "
+        "This may indicate the amplitude floor fix is not active for the speech routing path."
+    )
+    assert result.wid_match is True
+    assert result.signature_valid is True
 
 
 @pytest.mark.integration

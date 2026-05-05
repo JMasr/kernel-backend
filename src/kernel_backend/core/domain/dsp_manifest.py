@@ -17,8 +17,12 @@ from dataclasses import dataclass
 class AudioWIDConfig:
     """Audio WID beacon (DSSS + DWT) calibrated constants."""
     chips_per_bit: int = 32
-    target_snr_db_audio_only: float = -20.0   # 256k AAC survival
-    target_snr_db_av: float = -18.0           # double-AAC 256k+ survival
+    # These are fallback defaults used only when audio_params is passed explicitly
+    # (bypassing the content-adaptive router). The router overrides these per content
+    # type: speech → -12.0 dB (cD2 band has low energy; floor=5e-4 also applied),
+    # music → -16.0 dB, classical/ambient → -18.0 dB. See algorithm_router.py.
+    target_snr_db_audio_only: float = -20.0
+    target_snr_db_av: float = -18.0
     dwt_levels: tuple[int, ...] = (2,)        # single-band cD2 (5.5-11 kHz)
     erasure_threshold_z: float = 1.0
     masking_alpha: float = 0.70

@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from kernel_backend.core.domain.identity import Certificate
@@ -53,6 +54,59 @@ def synthetic_av_120s(tmp_path_factory) -> Path:
             "ffmpeg", "-y",
             "-f", "lavfi", "-i", "testsrc=duration=120:size=960x540:rate=15,noise=c0s=100:allf=t",
             "-f", "lavfi", "-i", "anoisesrc=duration=120:sample_rate=44100",
+            "-ac", "1",
+            "-c:v", "libx264", "-crf", "0", "-preset", "ultrafast",
+            "-c:a", "aac", "-ar", "44100",
+            str(out),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return out
+
+
+@pytest.fixture(scope="module")
+def synthetic_av_speech_like_120s(tmp_path_factory) -> Path:
+    """120s AV file whose audio track is speech-like (LP-filtered noise, 3.5 kHz cutoff).
+
+    Video: synthetic test pattern (960x540 lossless)
+    Audio: 4th-order Butterworth LP at 3500 Hz with 1.5s/1.0s burst pattern.
+
+    The audio is designed to hit the speech branch of the content profiler
+    (flatness≈0, centroid≈1750 Hz, low_energy>0.35) so that sign_av routes
+    to the cD2 detail band — the path that caused production failures.
+    """
+    from scipy.signal import butter, lfilter
+    import scipy.io.wavfile as wavfile
+
+    SR = 44100
+    duration_s = 120
+    n = SR * duration_s
+    rng = np.random.default_rng(43)
+
+    active_len = int(1.5 * SR)
+    silent_len = int(1.0 * SR)
+    raw = np.zeros(n, dtype=np.float64)
+    pos = 0
+    while pos < n:
+        end = min(pos + active_len, n)
+        raw[pos:end] = rng.standard_normal(end - pos)
+        pos = end + silent_len
+
+    b, a = butter(4, 3500.0 / (SR / 2.0), btype="low")
+    audio = (lfilter(b, a, raw) * 0.25).astype(np.float32)
+
+    tmp = tmp_path_factory.mktemp("integ_av_speech")
+    audio_path = tmp / "speech_audio.wav"
+    wavfile.write(str(audio_path), SR, (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16))
+
+    out = tmp / "av_speech_like_120s.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", "testsrc=duration=120:size=960x540:rate=15,noise=c0s=100:allf=t",
+            "-i", str(audio_path),
+            "-map", "0:v", "-map", "1:a",
             "-ac", "1",
             "-c:v", "libx264", "-crf", "0", "-preset", "ultrafast",
             "-c:a", "aac", "-ar", "44100",
@@ -261,6 +315,86 @@ async def test_av_sign_verify_h264_crf35(
 
     assert result.red_reason != RedReason.VIDEO_WID_MISMATCH
     assert result.red_reason != RedReason.AUDIO_WID_MISMATCH
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+async def test_av_sign_verify_speech_routing(
+    synthetic_av_speech_like_120s: Path,
+) -> None:
+    """
+    [BLOCKING — regression] sign_av → verify_av with content-adaptive speech routing.
+
+    The audio track is LP-filtered noise (< 3.5 kHz) that the content profiler
+    classifies as 'speech', routing to the cD2 detail band. This is the path
+    that caused production failures: low cD2 band energy makes the watermark
+    amplitude negligible unless the 5e-4 amplitude floor in embed_segment is active.
+
+    Verifies:
+    - Content profiler classifies LP-filtered audio as 'speech'
+    - sign_av routes to detail subband (no explicit audio_params)
+    - Full sign+verify roundtrip returns VERIFIED
+    """
+    from kernel_backend.engine.audio.algorithm_router import route
+    from kernel_backend.engine.audio.content_profiler import profile_audio
+    import librosa
+
+    private_pem, public_pem = generate_keypair()
+    cert = _make_cert(public_pem)
+    storage = FakeStorage()
+    registry = FakeRegistry()
+    media = MediaService()
+
+    # Confirm the audio track classifies as speech before signing
+    samples, _ = librosa.load(str(synthetic_av_speech_like_120s), sr=22050, mono=True)
+    content_profile = profile_audio(samples, 22050)
+    assert content_profile.content_type == "speech", (
+        f"AV fixture audio must classify as 'speech', got '{content_profile.content_type}' "
+        f"(confidence={content_profile.confidence:.2f})"
+    )
+    routing = route(content_profile)
+    assert routing.parameters["target_subband"] == "detail", (
+        f"Speech must route to 'detail' subband, got '{routing.parameters['target_subband']}'"
+    )
+
+    # Sign WITHOUT explicit audio_params — content profiler + router must run
+    sign_result = await sign_av(
+        media_path=synthetic_av_speech_like_120s,
+        certificate=cert,
+        private_key_pem=private_pem,
+        storage=storage,
+        registry=registry,
+        pepper=PEPPER,
+        media=media,
+    )
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        signed_path = Path(tmp.name)
+    try:
+        signed_bytes = await storage.get(sign_result.signed_media_key)
+        signed_path.write_bytes(signed_bytes)
+
+        service = VerificationService()
+        result: AVVerificationResult = await service.verify_av(
+            media_path=signed_path,
+            media=media,
+            storage=storage,
+            registry=registry,
+            pepper=PEPPER,
+        )
+    finally:
+        signed_path.unlink(missing_ok=True)
+
+    assert result.verdict == Verdict.VERIFIED, (
+        f"Expected VERIFIED but got {result.verdict} (reason={result.red_reason}). "
+        f"Audio: {result.audio_n_decoded}/{result.audio_n_segments} decoded "
+        f"({result.audio_n_erasures} erasures). "
+        "This may indicate the amplitude floor fix is not active for speech routing."
+    )
+    assert result.audio_verdict == Verdict.VERIFIED
+    assert result.video_verdict == Verdict.VERIFIED
+    assert result.wid_match is True
+    assert result.signature_valid is True
 
 
 @pytest.mark.integration

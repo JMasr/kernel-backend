@@ -82,6 +82,11 @@ def embed_segment(
         if band_rms < 1e-10:
             band_rms = 1.0
         amplitude = band_rms * (10.0 ** (target_snr_db / 20.0)) / np.sqrt(n_bands)
+        # Floor: low-energy subbands (e.g., cD2 for speech, band_rms≈0.002) sit below
+        # AAC quantisation noise (~0.007 RMS). Without a floor, amplitude≈0.0002 → Z≈0.7
+        # post-codec, which is below ERASURE_THRESHOLD_Z=1.0 for almost every segment.
+        # 5e-4/sqrt(n_bands) gives Z≈2.3 for typical speech segments (n_tiles≈34, 256k AAC).
+        amplitude = max(amplitude, 5e-4 / np.sqrt(n_bands))
 
         tile_count = max(1, len(band) // n_chips)
 
