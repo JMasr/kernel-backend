@@ -90,7 +90,7 @@ async def test_create_api_key_generates_krnl_prefix():
     org_id = uuid.uuid4()
     captured = {}
 
-    async def fake_create_api_key(org_id, key_hash, key_prefix, name):
+    async def fake_create_api_key(org_id, key_hash, key_prefix, name, scopes=None, expires_at=None):
         captured["key_hash"] = key_hash
         captured["key_prefix"] = key_prefix
         return _make_api_key(org_id, key_hash=key_hash, prefix=key_prefix)
